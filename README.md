@@ -146,9 +146,10 @@ votes) shares a name it searches under. If so, the release gets the show's
 first-air year after the title (`DuckTales 2017 S01E16 - …`) so Sonarr doesn't
 file it under the other show; without a namesake nothing changes. And a file
 matched only under a shared name must prove it's ours: it's kept when it
-carries our year or the (English or Czech) name of an episode of our requested
-season, and dropped when it carries the other show's year or episode name, or
-nothing either way. If TMDB can't answer, nothing is dropped.
+carries our year or the (English or Czech) name of any of our episodes — from
+any season, as TMDB and TVDB split seasons differently — and dropped when it
+carries the other show's year or episode name, or nothing either way. If TMDB
+can't answer, nothing is dropped.
 
 ## Measured quality
 

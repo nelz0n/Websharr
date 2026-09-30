@@ -1259,15 +1259,19 @@ def test_probe_budget_answers_in_time_and_measures_on():
 
 
 # --- same-named shows (DuckTales 1987 vs 2017) ---------------------------------
-# Season 1 episode names as TMDB gives them (English, then Czech); both shows
-# have a "Sweet Duck of Youth" here, so that name proves nothing.
-_DT87 = {6: ("Don't Give Up the Ship", "Neopouštějte loď!"),
-         9: ("Sphinx for the Memories", "Pasák"),
-         12: ("Master of the Djinni", "Kdo je pánem džina"),
-         20: ("Sweet Duck of Youth", "Sladké kachní mládí")}
-_DT17 = {9: ("Beware the B.U.D.D.Y. System!", "Pozor na systém K.A.M.A.R.Á.D."),
-         16: ("The Beagle Birthday Massacre!", "Narozeninový masakr"),
-         20: ("Sweet Duck of Youth", "Sladké kachní mládí")}
+# Episode names as TMDB gives them, by (season, episode), English then Czech.
+# Both shows have a "Sweet Duck of Youth" here, so that name proves nothing.
+# TMDB keeps DuckTales (1987) in one long season 1 that TVDB/Sonarr split, so
+# "Pasák" is S01E09 on TMDB whatever season Sonarr asks for.
+_DT87 = {(1, 1): ("Don't Give Up the Ship (1)", "Neopouštějte loď!"),
+         (1, 9): ("Armstrong", "Pasák"),
+         (1, 12): ("Master of the Djinni", "Kdo je pánem džina"),
+         (1, 20): ("Sweet Duck of Youth", "Sladké kachní mládí"),
+         (1, 70): ("Liquid Assets", "Tekutá aktiva")}
+_DT17 = {(1, 9): ("Beware the B.U.D.D.Y. System!", "Pozor na systém K.A.M.A.R.Á.D."),
+         (1, 16): ("The Beagle Birthday Massacre!", "Narozeninový masakr"),
+         (1, 20): ("Sweet Duck of Youth", "Sladké kachní mládí"),
+         (2, 3): ("The Golden Spear!", "Zlaté kopí!")}
 _SHOWS = {  # tvdbid -> (lookup_by_id result, own TMDB id, namesakes)
     "330134": (("DuckTales", "", "en", ("Kačeří příběhy",), 2017), 72350,
                ((720, 1987, ("DuckTales", "Kačeří příběhy")),)),
@@ -1294,14 +1298,14 @@ def _patch_ducktales(monkeypatch, torznab, *, namesakes=True, seasons=True):
         calls.append(tvdbid)
         return _SHOWS[tvdbid][2] if namesakes else ()
 
-    async def season_titles(token, tmdbid=None, imdbid=None, tvdbid=None, season=None):
+    async def show_titles(token, tmdbid=None, imdbid=None, tvdbid=None, specials=False):
         tid = int(tmdbid) if tmdbid else _SHOWS[tvdbid][1]
-        return _SEASONS[tid] if seasons and int(season) == 1 else {}
+        return _SEASONS[tid] if seasons else {}
 
     monkeypatch.setattr(torznab, "tmdb_lookup_by_id", by_id)
     monkeypatch.setattr(torznab, "tmdb_lookup", by_name)
     monkeypatch.setattr(torznab, "tmdb_namesakes", same_named)
-    monkeypatch.setattr(torznab, "tmdb_season_titles", season_titles)
+    monkeypatch.setattr(torznab, "tmdb_show_titles", show_titles)
     return calls
 
 
@@ -1315,9 +1319,9 @@ _DT_FILES = [
 ]
 
 
-def _dt_search(client, fake_webshare, tvdbid, **extra):
+def _dt_search(client, fake_webshare, tvdbid, files=None, **extra):
     fake_webshare.fuzzy = True
-    fake_webshare.results = list(_DT_FILES)
+    fake_webshare.results = list(files or _DT_FILES)
     resp = client.get("/torznab/api", params={
         "t": "tvsearch", "apikey": "testkey", "tvdbid": tvdbid, "season": "1", **extra})
     items = ET.fromstring(resp.content).findall("channel/item")
@@ -1407,8 +1411,26 @@ def test_no_namesake_nothing_dropped_no_year(client, fake_webshare, monkeypatch)
     assert calls == ["330134"]
 
 
+def test_namesake_evidence_from_any_season(client, fake_webshare, monkeypatch):
+    """Sonarr (TVDB) asks DuckTales (1987) season 2 for an episode TMDB keeps in
+    its long season 1: the name is still ours. A 2017 season-2 episode name
+    in a 2017 season-1 search is still ours too."""
+    from app import torznab
+    _patch_ducktales(monkeypatch, torznab)
+    files = [SearchResult("s2", "Kaceri pribehy S02E05 - Tekuta aktiva CZ 1080p.mkv", 500_000_000),
+             SearchResult("p87", "Kaceri pribehy S02E09 - Pasak CZ 1080p.mkv", 500_000_000),
+             SearchResult("m17", "Kaceri pribehy S02E16 - Narozeninovy masakr CZ 1080p.mkv", 500_000_000),
+             SearchResult("bare", "Kaceri pribehy S02E03 CZ 1080p.mkv", 500_000_000)]
+    got = _dt_search(client, fake_webshare, "75931", files, season="2")
+    assert sorted(got) == ["p87", "s2"]
+    assert got["s2"].startswith("DuckTales 1987 S02E05 - ")
+    got = _dt_search(client, fake_webshare, "330134",
+                     [SearchResult("g", "Kaceri pribehy S01E03 - Zlate kopi CZ.mkv", 500_000_000)])
+    assert list(got) == ["g"]
+
+
 def test_namesake_without_season_names_keeps_files_but_adds_year(client, fake_webshare, monkeypatch):
-    """Season names unavailable (TMDB down, a season TMDB lacks): nothing can be
+    """Episode names unavailable (TMDB down): nothing can be
     proven, so nothing is dropped — but the year still keeps Sonarr on the
     right show."""
     from app import torznab

@@ -130,7 +130,7 @@ def wait_for(predicate, timeout: float = 5.0) -> bool:
 def _no_tmdb_runtime(monkeypatch):
     """Tests never reach TMDB for runtimes, namesakes or episode names; those
     checks stay off unless a test patches `tmdb_runtime`/`tmdb_namesakes`/
-    `tmdb_season_titles` itself."""
+    `tmdb_show_titles` itself."""
     import app.torznab as torznab
 
     async def none(*args, **kwargs):
@@ -144,7 +144,7 @@ def _no_tmdb_runtime(monkeypatch):
 
     monkeypatch.setattr(torznab, "tmdb_runtime", none)
     monkeypatch.setattr(torznab, "tmdb_namesakes", no_namesakes)
-    monkeypatch.setattr(torznab, "tmdb_season_titles", no_names)
+    monkeypatch.setattr(torznab, "tmdb_show_titles", no_names)
 
 def _fresh_probe_state(monkeypatch):
     """The file_info cache and limiter are process-wide; start every test clean

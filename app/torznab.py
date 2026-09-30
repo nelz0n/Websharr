@@ -35,7 +35,7 @@ from .tmdb import lookup as tmdb_lookup
 from .tmdb import lookup_by_id as tmdb_lookup_by_id
 from .tmdb import namesakes as tmdb_namesakes
 from .tmdb import runtime as tmdb_runtime
-from .tmdb import season_titles as tmdb_season_titles
+from .tmdb import show_titles as tmdb_show_titles
 from .webshare import SearchResult, WebshareError
 
 logger = logging.getLogger("websharr.torznab")
@@ -916,8 +916,8 @@ def _near_word(a: str, b: str) -> bool:
     return a[i + (len(a) == len(b)):] == b[i + 1:]
 
 
-def namesake_reason(query, name: str, year: int, own: dict[int, tuple[str, ...]],
-                    others: list[tuple[int, dict[int, tuple[str, ...]]]]) -> str:
+def namesake_reason(query, name: str, year: int, own: dict[tuple[int, int], tuple[str, ...]],
+                    others: list[tuple[int, dict[tuple[int, int], tuple[str, ...]]]]) -> str:
     """Why a file matched only under a name another show shares can't be told
     to be ours ("" when it can).
 
@@ -925,11 +925,11 @@ def namesake_reason(query, name: str, year: int, own: dict[int, tuple[str, ...]]
     same episode numbers and ~22-minute episodes: "Kaceri pribehy S01E09 -
     Pasak" is a 1987 episode, and only its name says so. A file is ours when it
     carries our first-air year or the name (English or Czech, one typo allowed
-    in a long word) of an episode of our requested season — any episode:
-    uploads may number them differently. It is not when it carries the other
-    show's year or one of its episode names instead, nor when it carries
-    neither. Names both seasons have prove nothing.
-    `others` are the namesakes as (first-air year, the same season's names).
+    in a long word) of any of our episodes — whatever its number: uploads, TMDB
+    and TVDB number and split seasons differently. It is not when it carries
+    the other show's year or one of its episode names instead, nor when it
+    carries neither. Names both shows have prove nothing. `own` and each of
+    `others` (first-air year, names) map (season, episode) to episode names.
     """
     other_years = [y for y, _ in others if y]
     for y in _year_tokens(name):
@@ -950,9 +950,9 @@ def namesake_reason(query, name: str, year: int, own: dict[int, tuple[str, ...]]
     def at(key, i) -> bool:
         return len(rest) - i >= len(key) and all(_near_word(k, w) for k, w in zip(key, rest[i:]))
 
-    def keys(season: dict[int, tuple[str, ...]]) -> dict[tuple[str, ...], str]:
+    def keys(show: dict) -> dict[tuple[str, ...], str]:
         out = {}
-        for titles in season.values():
+        for titles in show.values():
             for title in titles:
                 # "B.U.D.D.Y." may be written either way in a file name
                 for variant in {title, _ACRONYM_RE.sub(lambda m: m.group().replace(".", ""), title)}:
@@ -963,8 +963,8 @@ def namesake_reason(query, name: str, year: int, own: dict[int, tuple[str, ...]]
 
     mine = keys(own)
     theirs: dict[tuple[str, ...], str] = {}
-    for _, season in others:
-        for key, title in keys(season).items():
+    for _, show in others:
+        for key, title in keys(show).items():
             theirs.setdefault(key, title)
     for key in set(mine) & set(theirs):  # both shows have it: no evidence either way
         del mine[key], theirs[key]
@@ -1304,7 +1304,7 @@ async def _newznab(request: Request, source: Source):
     merged, alternates, grabs = group_duplicates(merged, episodes)
     if found > len(merged):
         logger.info("Merged %d duplicate uploads into %d releases", found - len(merged), len(alternates))
-    if ambiguous and want_season is not None:
+    if ambiguous:
         merged = await _drop_namesake_files(merged, titles, ambiguous, year, namesakes, want_season,
                                             params.get("tmdbid"), params.get("imdbid"), params.get("tvdbid"))
     merged.sort(key=lambda r: (-relevance(queries, r.name), -r.size))
@@ -1343,26 +1343,26 @@ async def _newznab(request: Request, source: Source):
 
 
 async def _drop_namesake_files(results: list[SearchResult], titles: list[str], ambiguous: set[str],
-                               year: int, namesakes, season: int, tmdbid, imdbid, tvdbid
+                               year: int, namesakes, season: int | None, tmdbid, imdbid, tvdbid
                                ) -> list[SearchResult]:
     """Drop files matched only under a name a same-named other show shares and
     carrying no evidence of being ours (see namesake_reason).
 
     Name-only, so it runs over every candidate before the limit cut and the
-    probe. Needs this season's episode names on TMDB; without them (TMDB down,
-    a season TMDB numbers differently) nothing is dropped. A namesake without
-    this season can't be confused with it and is left out.
+    probe. Evidence comes from the episode names of every season of each show
+    (TMDB and TVDB split seasons differently); when any show's names are
+    unknown (TMDB down), nothing is dropped.
     """
-    own = await tmdb_season_titles(settings.tmdb_token, tmdbid, imdbid, tvdbid, season)
+    specials = season == 0
+    own = await tmdb_show_titles(settings.tmdb_token, tmdbid, imdbid, tvdbid, specials)
     if not own:
         return results
     others = []
     for oid, oyear, _ in namesakes:
-        names = await tmdb_season_titles(settings.tmdb_token, oid, None, None, season)
-        if names:
-            others.append((oyear, names))
-    if not others:
-        return results
+        names = await tmdb_show_titles(settings.tmdb_token, oid, None, None, specials)
+        if not names:
+            return results
+        others.append((oyear, names))
     kept = []
     for r in results:
         matched = [x for x in titles if matches_query([x], r.name)]

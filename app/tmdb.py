@@ -366,59 +366,75 @@ async def runtime(token: str, kind: str, tmdbid=None, imdbid=None, tvdbid=None,
     return minutes
 
 
-# (TMDB id, season) -> {episode number: its names}; see season_titles.
-_season_cache: dict[tuple, dict[int, tuple[str, ...]]] = {}
+# (TMDB id, with specials) -> {(season, episode): its names}; see show_titles.
+_show_cache: dict[tuple, dict[tuple[int, int], tuple[str, ...]]] = {}
+_APPEND_MAX = 20  # seasons TMDB's append_to_response takes per request
 
 
-async def season_titles(token: str, tmdbid=None, imdbid=None, tvdbid=None,
-                        season=None) -> dict[int, tuple[str, ...]]:
-    """Episode number -> its names (English, then the Czech one when TMDB has a
-    translation) for one season of a show, or {} when unknown.
+async def show_titles(token: str, tmdbid=None, imdbid=None, tvdbid=None, specials: bool = False
+                      ) -> dict[tuple[int, int], tuple[str, ...]]:
+    """(season, episode) -> the episode's names (English, then Czech when TMDB
+    has a translation) over every season of a show, or {} when unknown.
 
-    Uploads don't always number episodes the way TVDB/TMDB do: ZEPPELiN's
-    DuckTales follows the Disney+ order, which counts the five-part pilot as one
-    episode, so "Don't Give Up the Ship" is named S01E01. The episode name in the
-    file tells such a file apart. One season list serves every episode search of
-    that season; the TMDB id comes from what lookup_by_id/runtime resolved.
+    Every season, not just the one Sonarr asks for: TMDB and TVDB split seasons
+    differently (DuckTales 1987 is one 66-episode season on TMDB, four on
+    TVDB), so a season number can't pick the names. Specials (season 0) only
+    when asked for. One season list plus one request per language and 20
+    seasons (append_to_response), cached per show; a season missing from an
+    answer or any error makes the whole show unknown (not cached).
     """
-    if not token or season is None:
-        return {}
-    try:
-        season = int(season)
-    except (TypeError, ValueError):
+    if not token:
         return {}
     imdb = _imdb_id(imdbid)
     if not (tmdbid or imdb or tvdbid):
         return {}
     tid = _known_id("tv", tmdbid, imdb, tvdbid)
-    if tid and (tid, season) in _season_cache:
-        return _season_cache[(tid, season)]
-    names: dict[int, tuple[str, ...]] = {}
+    if tid and (tid, specials) in _show_cache:
+        return _show_cache[(tid, specials)]
+    names: dict[tuple[int, int], tuple[str, ...]] = {}
+    requests = 0
     try:
         async with httpx.AsyncClient(timeout=10.0, headers=_headers(token)) as client:
             if not tid:
                 tid = await _find_id(client, "tv", tmdbid, imdb, tvdbid)
+                requests += 1
             if not tid:
                 return {}
-            if (tid, season) in _season_cache:
-                return _season_cache[(tid, season)]
-            for language in ("en-US", "cs-CZ"):
-                r = await client.get(f"{_BASE}/tv/{tid}/season/{season}", params={"language": language})
-                if r.status_code != 200:
-                    if language == "en-US":
-                        return {}  # not cached: may be a passing failure
-                    continue
-                for e in r.json().get("episodes") or []:
-                    num, name = e.get("episode_number"), (e.get("name") or "").strip()
-                    have = names.get(num, ())
-                    # a missing cs translation comes back as the English name again
-                    if isinstance(num, int) and name and name.casefold() not in {x.casefold() for x in have}:
-                        names[num] = (*have, name)
+            if (tid, specials) in _show_cache:
+                return _show_cache[(tid, specials)]
+            r = await client.get(f"{_BASE}/tv/{tid}")
+            requests += 1
+            if r.status_code != 200:
+                return {}
+            seasons = [x.get("season_number") for x in r.json().get("seasons") or []]
+            seasons = [n for n in seasons if isinstance(n, int) and (n > 0 or specials)]
+            for i in range(0, len(seasons), _APPEND_MAX):
+                chunk = seasons[i:i + _APPEND_MAX]
+                for language in ("en-US", "cs-CZ"):
+                    r = await client.get(f"{_BASE}/tv/{tid}", params={
+                        "language": language, "append_to_response": ",".join(f"season/{n}" for n in chunk)})
+                    requests += 1
+                    if r.status_code != 200:
+                        return {}
+                    body = r.json()
+                    for n in chunk:
+                        season = body.get(f"season/{n}")
+                        if not isinstance(season, dict):
+                            logger.warning("TMDB tv %s: season %s missing from the %s answer", tid, n, language)
+                            return {}  # a gap would turn a real episode into "no evidence"
+                        for e in season.get("episodes") or []:
+                            num, name = e.get("episode_number"), (e.get("name") or "").strip()
+                            have = names.get((n, num), ())
+                            # a missing cs translation comes back as the English name again
+                            if isinstance(num, int) and name and name.casefold() not in {x.casefold() for x in have}:
+                                names[(n, num)] = (*have, name)
     except (httpx.HTTPError, KeyError, ValueError, TypeError, AttributeError) as exc:
-        logger.warning("TMDB season %s of tv (tmdb=%s tvdb=%s imdb=%s) failed: %s",
-                       season, tmdbid, tvdbid, imdb, exc)
+        logger.warning("TMDB episode names of tv (tmdb=%s tvdb=%s imdb=%s) failed: %s",
+                       tmdbid, tvdbid, imdb, exc)
         return {}
-    _put(_season_cache, (tid, season), names)
+    logger.info("TMDB: tv %s episode names: %d episodes in %d seasons, %d requests",
+                tid, len(names), len(seasons), requests)
+    _put(_show_cache, (tid, specials), names)
     return names
 
 
