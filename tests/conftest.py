@@ -146,6 +146,11 @@ def _no_tmdb_runtime(monkeypatch):
     monkeypatch.setattr(torznab, "tmdb_namesakes", no_namesakes)
     monkeypatch.setattr(torznab, "tmdb_show_titles", no_names)
 
+    async def no_title(*args, **kwargs):
+        return ""
+
+    monkeypatch.setattr(torznab, "skyhook_title", no_title)  # never reach Skyhook either
+
 def _fresh_probe_state(monkeypatch):
     """The file_info cache and limiter are process-wide; start every test clean
     and without real back-off sleeps."""

@@ -33,6 +33,7 @@ from .nzb import build_nzb
 from .settings import settings
 from .tmdb import lookup as tmdb_lookup
 from .tmdb import lookup_by_id as tmdb_lookup_by_id
+from .skyhook import series_title as skyhook_title
 from .tmdb import namesakes as tmdb_namesakes
 from .tmdb import runtime as tmdb_runtime
 from .tmdb import show_titles as tmdb_show_titles
@@ -1239,6 +1240,13 @@ async def _newznab(request: Request, source: Source):
     shared = {_series_key(n) for _, _, names in namesakes for n in names} - {""}
     ambiguous = {x for x in titles if _series_key(x) in shared}
     release_name = f"{display} {year}" if year and _series_key(display) in shared else display
+    if t == "tvsearch" and params.get("tvdbid"):
+        # Name the release as Sonarr names the series (TVDB via Skyhook): it
+        # maps a release by that title, and TMDB's can differ ("Maxipes Fík"
+        # vs "Maxidog Fík") or lack the disambiguation ("DuckTales (2017)").
+        sonarr_title = await skyhook_title(params.get("tvdbid"))
+        if sonarr_title:
+            release_name = sonarr_title
 
     if not queries and (params.get("q") or by_id):
         # A real search that yields nothing to look for (an id TMDB can't

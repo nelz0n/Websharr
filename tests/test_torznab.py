@@ -1452,3 +1452,69 @@ def test_non_ambiguous_show_unchanged(client, fake_webshare, monkeypatch):
         "t": "tvsearch", "apikey": "testkey", "tvdbid": "353546", "season": "1", "ep": "1"})
     titles = [i.findtext("title") for i in ET.fromstring(resp.content).findall("channel/item")]
     assert len(titles) == 1 and titles[0].startswith("Bluey S01E01 - Bluey CZ")
+
+
+def test_tv_release_is_named_as_sonarr_names_the_series(client, fake_webshare, monkeypatch):
+    """Sonarr maps a release by its series title, which comes from TVDB: TMDB's
+    "Maxipes Fik" was matched only by id (no automatic import); Sonarr's
+    "Maxidog Fík" from Skyhook names the release instead."""
+    from app import torznab
+    from app.settings import settings
+    monkeypatch.setattr(settings, "aliases", [])
+    monkeypatch.setattr(settings, "tmdb_token", "tok")
+
+    async def by_id(token, kind, tmdbid=None, imdbid=None, tvdbid=None):
+        return ("Maxipes Fik", "Maxipes Fík", "cs", (), 1976)
+
+    async def by_name(token, kind, q):
+        return None
+
+    async def sonarr_title(tvdbid):
+        return "Maxidog Fík" if str(tvdbid) == "181471" else ""
+
+    monkeypatch.setattr(torznab, "tmdb_lookup_by_id", by_id)
+    monkeypatch.setattr(torznab, "tmdb_lookup", by_name)
+    monkeypatch.setattr(torznab, "skyhook_title", sonarr_title)
+    fake_webshare.results = [SearchResult("f1", "Maxipes Fik 01 - Zrozeni Maxipsa Fika.avi", 300_000_000)]
+    resp = client.get("/torznab/api", params={
+        "t": "tvsearch", "apikey": "testkey", "tvdbid": "181471", "season": "1", "ep": "1"})
+    assert ET.fromstring(resp.content).findtext("channel/item/title").startswith("Maxidog Fik S01E01 - ")
+
+
+def test_skyhook_title_cached_and_fails_open(monkeypatch):
+    import asyncio
+
+    import httpx
+
+    from app import skyhook
+    calls = []
+
+    class Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url):
+            calls.append(url)
+            if url.endswith("/1"):
+                raise httpx.ConnectError("down")
+
+            class R:
+                status_code = 200
+
+                def json(self):
+                    return {"title": "DuckTales (2017)"}
+            return R()
+
+    monkeypatch.setattr(skyhook.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(skyhook, "_cache", {})
+    assert asyncio.run(skyhook.series_title("330134")) == "DuckTales (2017)"
+    assert asyncio.run(skyhook.series_title("330134")) == "DuckTales (2017)"
+    assert len(calls) == 1
+    assert asyncio.run(skyhook.series_title("1")) == ""  # failure: TMDB title stays
+    assert asyncio.run(skyhook.series_title("abc")) == "" and len(calls) == 2
