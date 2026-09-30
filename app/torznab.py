@@ -336,6 +336,10 @@ async def _file_info(client, ident: str) -> dict:
     return {}
 
 
+_PROBE_BUDGET = 45  # seconds a search may spend measuring files (see _probe)
+_background_probes: set = set()  # probes that outlived the budget (kept referenced)
+
+
 async def _probe(file_info, results: list[SearchResult], all_files: bool = False
                  ) -> tuple[dict[str, int], dict[str, str], dict[str, int], dict[str, dict]]:
     """Fetch file_info (the source's `file_info(ident)`, {} when unknown) for
@@ -352,14 +356,30 @@ async def _probe(file_info, results: list[SearchResult], all_files: bool = False
     if not need:
         return {}, {}, {}, {}
 
-    async def one(r: SearchResult):
-        return r, await file_info(r.ident)
+    # Sonarr gives an indexer 100 s and then ignores it for minutes; ffprobing
+    # ~100 HellSpy results of a season search took 70-100+ s. What isn't measured
+    # within the budget goes out unmeasured (fail open, as on a probe error) and
+    # keeps measuring in the background, so the next search finds it cached.
+    # Tasks start in relevance order, so the best candidates are measured first.
+    tasks = {asyncio.ensure_future(file_info(r.ident)): r for r in need}
+    done, pending = await asyncio.wait(tasks, timeout=_PROBE_BUDGET)
+    if pending:
+        logger.info("Probe budget of %ds spent: %d of %d files go out unmeasured, measuring on in the background",
+                    _PROBE_BUDGET, len(pending), len(need))
+        for task in pending:
+            _background_probes.add(task)
+            task.add_done_callback(_background_probes.discard)
+
+    def result(task) -> dict:
+        if task not in done or task.cancelled() or task.exception() is not None:
+            return {}
+        return task.result() or {}
 
     heights: dict[str, int] = {}
     audio: dict[str, str] = {}
     lengths: dict[str, int] = {}
     infos: dict[str, dict] = {}
-    for r, info in await asyncio.gather(*(one(r) for r in need)):
+    for r, info in ((r, result(task)) for task, r in tasks.items()):
         if info:
             infos[r.ident] = info
         length = int(info.get("length") or 0) or r.duration

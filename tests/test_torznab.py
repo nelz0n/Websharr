@@ -1220,3 +1220,39 @@ def test_season_search_merges_only_within_an_episode(client, fake_webshare, monk
     assert "/torznab/nzb/e4b?" in items[0].findtext("link")
     assert "alt=e4a" in items[0].findtext("link")
     assert "alt=" not in items[1].findtext("link")
+
+
+def test_probe_budget_answers_in_time_and_measures_on():
+    """A slow source (ffprobe on ~100 HellSpy files) must not hold the answer past
+    Sonarr's 100 s: what isn't measured within the budget goes out unmeasured,
+    and the measuring finishes in the background."""
+    import asyncio
+    import time as _time
+
+    from app import torznab
+    finished = []
+
+    async def file_info(ident):
+        if ident == "slow":
+            await asyncio.sleep(0.5)
+            finished.append(ident)
+            return {"length": 600, "width": 1920, "height": 1080}
+        return {"length": 420, "width": 1280, "height": 720}
+
+    async def run():
+        old = torznab._PROBE_BUDGET
+        torznab._PROBE_BUDGET = 0.1
+        try:
+            t0 = _time.monotonic()
+            heights, _, lengths, infos = await torznab._probe(
+                file_info, [SearchResult("fast", "A S01E01.mkv", 1), SearchResult("slow", "A S01E02.mkv", 1)],
+                all_files=True)
+            took = _time.monotonic() - t0
+        finally:
+            torznab._PROBE_BUDGET = old
+        assert took < 0.4
+        assert heights == {"fast": 720} and "slow" not in infos
+        await asyncio.sleep(0.6)  # the slow probe keeps going and completes
+        assert finished == ["slow"]
+
+    asyncio.run(run())
