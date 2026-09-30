@@ -139,6 +139,17 @@ a short show's Czech name, a 20-minute special named like the feature, a
 5-minute excerpt. Extended cuts (up to 1.6×) and double episodes (up to 2.6×)
 still pass; files of unknown length are kept.
 
+**Same-named shows.** *DuckTales* (1987) and *DuckTales* (2017) are both
+`DuckTales` and both `Kačeří příběhy`, and Webshare file names carry no year.
+For an ID-based TV search Websharr asks TMDB whether another known show (20+
+votes) shares a name it searches under. If so, the release gets the show's
+first-air year after the title (`DuckTales 2017 S01E16 - …`) so Sonarr doesn't
+file it under the other show; without a namesake nothing changes. And a file
+matched only under a shared name must prove it's ours: it's kept when it
+carries our year or the (English or Czech) name of an episode of our requested
+season, and dropped when it carries the other show's year or episode name, or
+nothing either way. If TMDB can't answer, nothing is dropped.
+
 ## Measured quality
 
 Webshare's `file_info` is a media probe, so Websharr measures every shown file

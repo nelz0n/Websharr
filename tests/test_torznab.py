@@ -1256,3 +1256,177 @@ def test_probe_budget_answers_in_time_and_measures_on():
         assert finished == ["slow"]
 
     asyncio.run(run())
+
+
+# --- same-named shows (DuckTales 1987 vs 2017) ---------------------------------
+# Season 1 episode names as TMDB gives them (English, then Czech); both shows
+# have a "Sweet Duck of Youth" here, so that name proves nothing.
+_DT87 = {6: ("Don't Give Up the Ship", "Neopouštějte loď!"),
+         9: ("Sphinx for the Memories", "Pasák"),
+         12: ("Master of the Djinni", "Kdo je pánem džina"),
+         20: ("Sweet Duck of Youth", "Sladké kachní mládí")}
+_DT17 = {9: ("Beware the B.U.D.D.Y. System!", "Pozor na systém K.A.M.A.R.Á.D."),
+         16: ("The Beagle Birthday Massacre!", "Narozeninový masakr"),
+         20: ("Sweet Duck of Youth", "Sladké kachní mládí")}
+_SHOWS = {  # tvdbid -> (lookup_by_id result, own TMDB id, namesakes)
+    "330134": (("DuckTales", "", "en", ("Kačeří příběhy",), 2017), 72350,
+               ((720, 1987, ("DuckTales", "Kačeří příběhy")),)),
+    "75931": (("DuckTales", "", "en", ("Kačeří příběhy", "My z Kačerova"), 1987), 720,
+              ((72350, 2017, ("DuckTales", "Kačeří příběhy")),)),
+}
+_SEASONS = {720: _DT87, 72350: _DT17}
+
+
+def _patch_ducktales(monkeypatch, torznab, *, namesakes=True, seasons=True):
+    """Fake TMDB at the helper level; returns the namesakes() calls."""
+    from app.settings import settings
+    monkeypatch.setattr(settings, "aliases", [])
+    monkeypatch.setattr(settings, "tmdb_token", "tok")
+    calls = []
+
+    async def by_id(token, kind, tmdbid=None, imdbid=None, tvdbid=None):
+        return _SHOWS[tvdbid][0]
+
+    async def by_name(token, kind, q):
+        return None
+
+    async def same_named(token, tmdbid=None, imdbid=None, tvdbid=None):
+        calls.append(tvdbid)
+        return _SHOWS[tvdbid][2] if namesakes else ()
+
+    async def season_titles(token, tmdbid=None, imdbid=None, tvdbid=None, season=None):
+        tid = int(tmdbid) if tmdbid else _SHOWS[tvdbid][1]
+        return _SEASONS[tid] if seasons and int(season) == 1 else {}
+
+    monkeypatch.setattr(torznab, "tmdb_lookup_by_id", by_id)
+    monkeypatch.setattr(torznab, "tmdb_lookup", by_name)
+    monkeypatch.setattr(torznab, "tmdb_namesakes", same_named)
+    monkeypatch.setattr(torznab, "tmdb_season_titles", season_titles)
+    return calls
+
+
+_DT_FILES = [
+    SearchResult("p87", "Kaceri pribehy S01E09 - Pasak CZ Titulky 1080p.mkv", 500_000_000),
+    SearchResult("m17", "Kaceri pribehy S01E16 - Narozeninovy masakr CZ 1080p.mkv", 500_000_000),
+    SearchResult("y17", "Kaceri pribehy 2017 S01E04 CZ 1080p.mkv", 500_000_000),
+    SearchResult("bare", "Kaceri pribehy S01E03 CZ 1080p.mkv", 500_000_000),
+    SearchResult("both", "Kaceri pribehy S01E20 - Sladke kachni mladi CZ 1080p.mkv", 500_000_000),
+    SearchResult("kac", "My z Kacerova S01E07 CZ 1080p.mkv", 500_000_000),
+]
+
+
+def _dt_search(client, fake_webshare, tvdbid, **extra):
+    fake_webshare.fuzzy = True
+    fake_webshare.results = list(_DT_FILES)
+    resp = client.get("/torznab/api", params={
+        "t": "tvsearch", "apikey": "testkey", "tvdbid": tvdbid, "season": "1", **extra})
+    items = ET.fromstring(resp.content).findall("channel/item")
+    return {i.findtext("guid").removeprefix("websharr-"): i.findtext("title") for i in items}
+
+
+def test_namesake_reason():
+    from app.torznab import namesake_reason as why
+    titles = ["DuckTales", "Kačeří příběhy"]
+    others = [(1987, _DT87)]
+    assert why(titles, "Kaceri pribehy S01E16 - Narozeninovy masakr.mkv", 2017, _DT17, others) == ""
+    # any episode of the season counts, not just the requested number
+    assert why(titles, "Kaceri pribehy S01E02 - Narozeninovy masakr.mkv", 2017, _DT17, others) == ""
+    assert why(titles, "DuckTales S01E09 Beware the BUDDY System 1080p.mkv", 2017, _DT17, others) == ""
+    assert why(titles, "DuckTales.S01E09.Beware.the.B.U.D.D.Y.System.mkv", 2017, _DT17, others) == ""
+    assert why(titles, "Kaceri pribehy S01E09 Pozor na system KAMARAD.mkv", 2017, _DT17, others) == ""
+    assert why(titles, "Kaceri pribehy 2017 S01E04.mkv", 2017, _DT17, others) == ""
+    assert "Pasák" in why(titles, "Kaceri pribehy S01E09 - Pasak CZ Titulky 1080p.mkv", 2017, _DT17, others)
+    assert "Master of the Djinni" not in why(titles, "Kaceri pribehy 1987 S01E12.mkv", 2017, _DT17, others)
+    assert "1987" in why(titles, "Kaceri pribehy 1987 S01E12.mkv", 2017, _DT17, others)
+    assert "neither" in why(titles, "Kaceri pribehy S01E03 CZ 1080p.mkv", 2017, _DT17, others)
+    # one typo in a long word is still the name (TMDB "Neopouštějte" vs "Neopoustejte")
+    assert "Neopouštějte" in why(titles, "Kaceri pribehy Neopustejte lod CZ.mkv", 2017, _DT17, others)
+    assert "neither" in why(titles, "Kaceri pribehy Pasek CZ.mkv", 2017, _DT17, others)  # short word: exact
+    # a name both shows' seasons have proves nothing
+    assert "neither" in why(titles, "Kaceri pribehy S01E20 - Sladke kachni mladi.mkv", 2017, _DT17, others)
+    # 1080 is a resolution, not a year
+    assert "neither" in why(titles, "DuckTales S01E03 1080.mkv", 2017, _DT17, others)
+    # the other side of the same fixture
+    assert why(titles, "Kaceri pribehy S01E09 - Pasak CZ Titulky 1080p.mkv", 1987, _DT87, [(2017, _DT17)]) == ""
+    assert "Narozeninový masakr" in why(
+        titles, "Kaceri pribehy S01E16 - Narozeninovy masakr.mkv", 1987, _DT87, [(2017, _DT17)])
+
+
+def test_episode_key_single_word():
+    from app.torznab import episode_key
+    assert episode_key("Pasák") == ()
+    assert episode_key("Pasák", single_word=True) == ("pasak",)
+    assert episode_key("Don't Give Up the Ship") == ("dont", "give", "up", "the", "ship")
+    assert episode_key("Cold", single_word=True) == ("cold",)
+    for generic in ("Pilot", "Part 1", "Epizoda 5", "Kdo", ""):
+        assert episode_key(generic, single_word=True) == ()
+
+
+def test_namesake_season_search_2017(client, fake_webshare, monkeypatch):
+    """A DuckTales (2017) season search: the year goes after the title so Sonarr
+    doesn't file it under DuckTales (1987), and the 1987 episode "Pasák" is
+    dropped, as are files with no evidence either way. A file named after a
+    title only the other show has (none here for 2017) would be untouched."""
+    from app import torznab
+    calls = _patch_ducktales(monkeypatch, torznab)
+    got = _dt_search(client, fake_webshare, "330134")
+    assert sorted(got) == ["m17", "y17"]
+    assert got["m17"].startswith("DuckTales 2017 S01E16 - Kaceri pribehy - Narozeninovy masakr CZ")
+    assert got["y17"].startswith("DuckTales 2017 S01E04 - ")
+    assert calls == ["330134"]
+
+
+def test_namesake_season_search_1987(client, fake_webshare, monkeypatch):
+    """The same files for DuckTales (1987): "Pasák" is ours, the 2017 episode and
+    the 2017-stamped file are not, and "My z Kačerova" — a name only the 1987
+    show has — needs no evidence."""
+    from app import torznab
+    _patch_ducktales(monkeypatch, torznab)
+    got = _dt_search(client, fake_webshare, "75931")
+    assert sorted(got) == ["kac", "p87"]
+    assert got["p87"].startswith("DuckTales 1987 S01E09 - Kaceri pribehy - Pasak CZ")
+    assert got["kac"].startswith("DuckTales 1987 S01E07 - ")
+
+
+def test_namesake_episode_search_drops_the_other_shows_episode(client, fake_webshare, monkeypatch):
+    from app import torznab
+    _patch_ducktales(monkeypatch, torznab)
+    assert _dt_search(client, fake_webshare, "330134", ep="9") == {}
+    got = _dt_search(client, fake_webshare, "75931", ep="9")
+    assert list(got) == ["p87"] and got["p87"].startswith("DuckTales 1987 S01E09 - ")
+
+
+def test_no_namesake_nothing_dropped_no_year(client, fake_webshare, monkeypatch):
+    """No same-named show (or TMDB failed, which namesakes() reports the same
+    way): every file stays and the release title carries no year."""
+    from app import torznab
+    calls = _patch_ducktales(monkeypatch, torznab, namesakes=False)
+    got = _dt_search(client, fake_webshare, "330134")
+    assert sorted(got) == ["bare", "both", "m17", "p87", "y17"]  # "My z Kacerova" isn't a 2017 name
+    assert all(x.startswith("DuckTales S01E") for x in got.values())
+    assert calls == ["330134"]
+
+
+def test_namesake_without_season_names_keeps_files_but_adds_year(client, fake_webshare, monkeypatch):
+    """Season names unavailable (TMDB down, a season TMDB lacks): nothing can be
+    proven, so nothing is dropped — but the year still keeps Sonarr on the
+    right show."""
+    from app import torznab
+    _patch_ducktales(monkeypatch, torznab, seasons=False)
+    got = _dt_search(client, fake_webshare, "330134")
+    assert {"p87", "m17", "bare", "both"} <= set(got)
+    assert got["p87"].startswith("DuckTales 2017 S01E09 - ")
+
+
+def test_non_ambiguous_show_unchanged(client, fake_webshare, monkeypatch):
+    from app import torznab
+    from app.settings import settings
+    monkeypatch.setattr(settings, "aliases", [])
+    monkeypatch.setattr(settings, "tmdb_token", "tok")
+    _patch_tmdb(monkeypatch, torznab, ("Bluey", "", "en", (), 2018), 0)
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [SearchResult("b", "Bluey S01E01 CZ 1080p.mkv", 300_000_000)]
+    resp = client.get("/torznab/api", params={
+        "t": "tvsearch", "apikey": "testkey", "tvdbid": "353546", "season": "1", "ep": "1"})
+    titles = [i.findtext("title") for i in ET.fromstring(resp.content).findall("channel/item")]
+    assert len(titles) == 1 and titles[0].startswith("Bluey S01E01 - Bluey CZ")

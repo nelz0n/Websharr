@@ -33,7 +33,9 @@ from .nzb import build_nzb
 from .settings import settings
 from .tmdb import lookup as tmdb_lookup
 from .tmdb import lookup_by_id as tmdb_lookup_by_id
+from .tmdb import namesakes as tmdb_namesakes
 from .tmdb import runtime as tmdb_runtime
+from .tmdb import season_titles as tmdb_season_titles
 from .webshare import SearchResult, WebshareError
 
 logger = logging.getLogger("websharr.torznab")
@@ -747,6 +749,11 @@ def movie_title_prefix(display: str, year: int, titles, name: str) -> str:
     return f"{display} {year} - "
 
 
+def _year_tokens(name: str) -> list[int]:
+    return [int(t) for t in normalize_text(name).split()
+            if t.isdigit() and len(t) == 4 and 1900 <= int(t) <= 2099]
+
+
 def year_conflict(name: str, year: int) -> bool:
     """True when every year token in the file name contradicts the title's year.
 
@@ -758,8 +765,7 @@ def year_conflict(name: str, year: int) -> bool:
     """
     if not year:
         return False
-    years = [int(t) for t in normalize_text(name).split()
-             if t.isdigit() and len(t) == 4 and 1900 <= int(t) <= 2099]
+    years = _year_tokens(name)
     return bool(years) and all(abs(y - year) > 1 for y in years)
 
 
@@ -854,6 +860,124 @@ def file_marker(query, name: str) -> tuple[int | None, int | None]:
 def file_episode(query, name: str) -> int | None:
     """Episode number implied by the file name (see file_marker)."""
     return file_marker(query, name)[1]
+
+
+# Words that don't make an episode name recognisable on their own ("Pilot",
+# "Episode 1", "Part 2") and the short words around them.
+_GENERIC_EP_WORDS = frozenset("""
+pilot episode epizoda ep dil cast part pt chapter kapitola finale premiere special
+the a an of and or to in on at for i v ve na se z ze do o s k
+""".split())
+_PART_WORDS = frozenset({"part", "pt", "dil", "cast"})
+_ROMAN = frozenset({"i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"})
+_APOSTROPHE_RE = re.compile(r"['\u2019`]")
+# A dotted acronym ("B.U.D.D.Y.") that file names often write as one word.
+_ACRONYM_RE = re.compile(r"\b(?:\w\.){2,}\w?\b\.?")
+
+
+def _ep_words(text: str) -> list[str]:
+    """Normalized tokens with apostrophes dropped: "Don't" in an episode name
+    and "Dont" in a file name are the same word."""
+    return normalize_text(_APOSTROPHE_RE.sub("", text or "")).split()
+
+
+def episode_key(title: str, single_word: bool = False) -> tuple[str, ...]:
+    """An episode name as tokens to look for in a file name, or () when it is too
+    generic to tell episodes apart. A trailing part number ("(1)", "Part 2",
+    "Part II") is dropped: uploads rarely carry it, and TMDB and the uploader may
+    split a multi-part episode differently. `single_word` also accepts a name of
+    one distinctive word ("Pasák") — fine where only two shows' names compete."""
+    toks = _ep_words(title)
+    if len(toks) > 1 and (toks[-1].isdigit() or (toks[-1] in _ROMAN and toks[-2] in _PART_WORDS)):
+        toks = toks[:-1]
+        if toks[-1] in _PART_WORDS:
+            toks = toks[:-1]
+    words = [t for t in toks if t not in _GENERIC_EP_WORDS and not t.isdigit()]
+    if len(words) < 2 and not (single_word and words and len(words[0]) >= 4):
+        return ()
+    return tuple(toks)
+
+
+def _series_key(title: str) -> str:
+    """A search title as matches_query compares it: the title words only."""
+    return " ".join(_series_tokens(title))
+
+
+def _near_word(a: str, b: str) -> bool:
+    """Same word, allowing one typo in a long one: TMDB's "Neopuštějte loď!"
+    is "Neopoustejte lod" on Webshare."""
+    if a == b:
+        return True
+    if min(len(a), len(b)) < 6 or abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) > len(b):
+        a, b = b, a
+    i = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), len(a))
+    return a[i + (len(a) == len(b)):] == b[i + 1:]
+
+
+def namesake_reason(query, name: str, year: int, own: dict[int, tuple[str, ...]],
+                    others: list[tuple[int, dict[int, tuple[str, ...]]]]) -> str:
+    """Why a file matched only under a name another show shares can't be told
+    to be ours ("" when it can).
+
+    DuckTales (1987) and (2017) are both "Kačeří příběhy" on Webshare, with the
+    same episode numbers and ~22-minute episodes: "Kaceri pribehy S01E09 -
+    Pasak" is a 1987 episode, and only its name says so. A file is ours when it
+    carries our first-air year or the name (English or Czech, one typo allowed
+    in a long word) of an episode of our requested season — any episode:
+    uploads may number them differently. It is not when it carries the other
+    show's year or one of its episode names instead, nor when it carries
+    neither. Names both seasons have prove nothing.
+    `others` are the namesakes as (first-air year, the same season's names).
+    """
+    other_years = [y for y, _ in others if y]
+    for y in _year_tokens(name):
+        if abs(y - year) <= 1 and not any(abs(y - o) <= 1 for o in other_years):
+            return ""
+    for y in _year_tokens(name):
+        if any(abs(y - o) <= 1 for o in other_years) and not (year and abs(y - year) <= 1):
+            return f"{y} is the year of a same-named other show"
+
+    ntoks = _ep_words(name.rsplit(".", 1)[0] if _is_video(name) else name)
+    shows = [[t for t in _ep_words(x) if not _EP_TOKEN.match(t)] for x in _as_titles(query)]
+    start = max((len(s) for s in shows if s and ntoks[:len(s)] == s), default=0)
+    rest = ntoks[start:]
+
+    def inside(key, toks) -> bool:
+        return any(tuple(toks[i:i + len(key)]) == key for i in range(len(toks) - len(key) + 1))
+
+    def at(key, i) -> bool:
+        return len(rest) - i >= len(key) and all(_near_word(k, w) for k, w in zip(key, rest[i:]))
+
+    def keys(season: dict[int, tuple[str, ...]]) -> dict[tuple[str, ...], str]:
+        out = {}
+        for titles in season.values():
+            for title in titles:
+                # "B.U.D.D.Y." may be written either way in a file name
+                for variant in {title, _ACRONYM_RE.sub(lambda m: m.group().replace(".", ""), title)}:
+                    key = episode_key(variant, single_word=True)
+                    if key and not any(inside(key, s) for s in shows):  # an episode named like the show
+                        out.setdefault(key, title)
+        return out
+
+    mine = keys(own)
+    theirs: dict[tuple[str, ...], str] = {}
+    for _, season in others:
+        for key, title in keys(season).items():
+            theirs.setdefault(key, title)
+    for key in set(mine) & set(theirs):  # both shows have it: no evidence either way
+        del mine[key], theirs[key]
+    hits = [(i, i + len(key), key) for key in {**mine, **theirs} for i in range(len(rest)) if at(key, i)]
+    # the longest name wins: "Duck Hunt" inside "The Great Duck Hunt" is the latter
+    hits = [h for h in hits if not any(o[0] <= h[0] and h[1] <= o[1] and o[1] - o[0] > h[1] - h[0]
+                                       for o in hits)]
+    if any(h[2] in mine for h in hits):
+        return ""
+    other = next((theirs[h[2]] for h in hits if h[2] in theirs), "")
+    if other:
+        return f"names {other!r}, an episode of a same-named other show"
+    return "neither the year nor an episode name tells it from a same-named other show"
 
 
 def relevance(queries: list[str], name: str) -> float:
@@ -1103,8 +1227,20 @@ async def _newznab(request: Request, source: Source):
             if v not in queries:
                 queries.append(v)
     category = CAT_TV if t == "tvsearch" else CAT_MOVIES
+    by_id = any(params.get(k) for k in ("tvdbid", "imdbid", "tmdbid"))
+    # Another show sharing a name we search under (DuckTales 1987 and 2017 are
+    # both "DuckTales" and "Kačeří příběhy"): the release gets our first-air
+    # year after the title, or Sonarr files it under the other show, and files
+    # matched only under such a name must prove they're ours (namesake_reason).
+    namesakes = ()
+    if settings.tmdb_token and t == "tvsearch" and by_id:
+        namesakes = await tmdb_namesakes(settings.tmdb_token, params.get("tmdbid"),
+                                         params.get("imdbid"), params.get("tvdbid"))
+    shared = {_series_key(n) for _, _, names in namesakes for n in names} - {""}
+    ambiguous = {x for x in titles if _series_key(x) in shared}
+    release_name = f"{display} {year}" if year and _series_key(display) in shared else display
 
-    if not queries and (params.get("q") or any(params.get(k) for k in ("tvdbid", "imdbid", "tmdbid"))):
+    if not queries and (params.get("q") or by_id):
         # A real search that yields nothing to look for (an id TMDB can't
         # resolve, a query that normalizes to nothing): no results. The
         # placeholder below would show up as an unparseable row in *arr's
@@ -1168,6 +1304,9 @@ async def _newznab(request: Request, source: Source):
     merged, alternates, grabs = group_duplicates(merged, episodes)
     if found > len(merged):
         logger.info("Merged %d duplicate uploads into %d releases", found - len(merged), len(alternates))
+    if ambiguous and want_season is not None:
+        merged = await _drop_namesake_files(merged, titles, ambiguous, year, namesakes, want_season,
+                                            params.get("tmdbid"), params.get("imdbid"), params.get("tvdbid"))
     merged.sort(key=lambda r: (-relevance(queries, r.name), -r.size))
     logger.info("Newznab %s q=%r -> %d %s results", t, q, len(merged), source.label)
     # With an exact id, TMDB knows how long the title runs; files far off that
@@ -1197,10 +1336,43 @@ async def _newznab(request: Request, source: Source):
             kept.append(r)
         shown = kept[:limit]
     return _render_feed(request, shown, category, heights=heights, audio=audio,
-                        query=display, season=(season if t == "tvsearch" else None), ep=ep,
+                        query=release_name, season=(season if t == "tvsearch" else None), ep=ep,
                         episodes=episodes, language=language, czech_titles=czech_titles,
                         infos=infos, ids={k: params.get(k) for k in ("tmdbid", "imdbid", "tvdbid")},
                         titles=titles, year=year, alternates=alternates, grabs=grabs)
+
+
+async def _drop_namesake_files(results: list[SearchResult], titles: list[str], ambiguous: set[str],
+                               year: int, namesakes, season: int, tmdbid, imdbid, tvdbid
+                               ) -> list[SearchResult]:
+    """Drop files matched only under a name a same-named other show shares and
+    carrying no evidence of being ours (see namesake_reason).
+
+    Name-only, so it runs over every candidate before the limit cut and the
+    probe. Needs this season's episode names on TMDB; without them (TMDB down,
+    a season TMDB numbers differently) nothing is dropped. A namesake without
+    this season can't be confused with it and is left out.
+    """
+    own = await tmdb_season_titles(settings.tmdb_token, tmdbid, imdbid, tvdbid, season)
+    if not own:
+        return results
+    others = []
+    for oid, oyear, _ in namesakes:
+        names = await tmdb_season_titles(settings.tmdb_token, oid, None, None, season)
+        if names:
+            others.append((oyear, names))
+    if not others:
+        return results
+    kept = []
+    for r in results:
+        matched = [x for x in titles if matches_query([x], r.name)]
+        reason = namesake_reason(titles, r.name, year, own, others) \
+            if matched and all(x in ambiguous for x in matched) else ""
+        if reason:
+            logger.info("Dropped %r: %s", r.name, reason)
+            continue
+        kept.append(r)
+    return kept
 
 
 @router.get("/torznab/nzb/{ident}")
