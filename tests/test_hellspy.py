@@ -139,6 +139,7 @@ def test_probe_info_maps_ffprobe_to_file_info():
 def probe_state(monkeypatch):
     """Clean probe cache/limiter, ffprobe "installed" and faked per test."""
     hellspy._probe_cache.clear()
+    hellspy._probe_failed.clear()
     monkeypatch.setattr(hellspy, "_probe_sem", None)
     monkeypatch.setattr(hellspy, "_ffprobe", "/usr/bin/ffprobe")
     monkeypatch.setattr(hellspy, "_ffprobe_missing", False)
@@ -166,11 +167,19 @@ def test_probe_caches_and_fails_open(probe_state):
     asyncio.run(hellspy.probe(client, "hs:1:a"))
     assert len(probe_state.runs) == 1 and client.links_asked == ["hs:1:a"]
 
-    for failure in (asyncio.TimeoutError(), RuntimeError("Server returned 403 Forbidden"),
-                    json.JSONDecodeError("x", "", 0)):
+    for n, failure in enumerate((asyncio.TimeoutError(), RuntimeError("Server returned 403 Forbidden"),
+                                 json.JSONDecodeError("x", "", 0))):
         probe_state({"*": failure})
-        assert asyncio.run(hellspy.probe(client, "hs:2:b")) == {}
-    assert "hs:2:b" not in hellspy._probe_cache  # failures are asked again next time
+        assert asyncio.run(hellspy.probe(client, f"hs:2:{n}")) == {}
+    assert not any(k.startswith("hs:2:") for k in hellspy._probe_cache)
+
+    # a failed file is left alone for a while instead of costing a probe on every search
+    runs = len(probe_state.runs)
+    assert asyncio.run(hellspy.probe(client, "hs:2:0")) == {}
+    assert len(probe_state.runs) == runs
+    hellspy._probe_failed["hs:2:0"] -= hellspy.PROBE_RETRY_AFTER
+    probe_state({"*": FFPROBE_JSON})
+    assert asyncio.run(hellspy.probe(client, "hs:2:0"))["height"] == 1608
 
     async def dead(ident):
         raise HellspyError("HellSpy returned no download link (HTTP 404)")
@@ -183,6 +192,7 @@ def test_probe_times_out_a_hanging_ffprobe(monkeypatch, tmp_path):
     """The real subprocess path: a stand-in ffprobe that never answers is
     killed after PROBE_TIMEOUT and the probe fails open."""
     hellspy._probe_cache.clear()
+    hellspy._probe_failed.clear()
     monkeypatch.setattr(hellspy, "_probe_sem", None)
     slow = tmp_path / "ffprobe"
     slow.write_text("#!/bin/sh\nsleep 30\n")
@@ -195,6 +205,7 @@ def test_probe_times_out_a_hanging_ffprobe(monkeypatch, tmp_path):
 
 def test_missing_ffprobe_is_logged_once(monkeypatch, caplog):
     hellspy._probe_cache.clear()
+    hellspy._probe_failed.clear()
     monkeypatch.setattr(hellspy, "_ffprobe", None)
     monkeypatch.setattr(hellspy, "_ffprobe_missing", False)
     monkeypatch.setattr(hellspy.shutil, "which", lambda name: None)

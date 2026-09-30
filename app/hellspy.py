@@ -177,6 +177,10 @@ def search_result(item: dict) -> SearchResult | None:
 PROBE_TIMEOUT = 20.0
 PROBE_CONCURRENCY = 3
 PROBE_CACHE_MAX = 5000
+# A file that couldn't be measured (timeout, dead link) is left alone this long,
+# so it doesn't cost PROBE_TIMEOUT on every search that lists it.
+PROBE_RETRY_AFTER = 30 * 60
+_probe_failed: dict[str, float] = {}
 _probe_sem: asyncio.Semaphore | None = None
 _probe_cache: dict[str, dict] = {}
 _ffprobe: str | None = None
@@ -263,10 +267,18 @@ def _have_ffprobe() -> bool:
     return not _ffprobe_missing
 
 
+def _remember_failure(ident: str) -> None:
+    if len(_probe_failed) >= PROBE_CACHE_MAX:
+        _probe_failed.pop(next(iter(_probe_failed)))
+    _probe_failed[ident] = time.monotonic()
+
+
 async def probe(client, ident: str) -> dict:
     """Measured file_info for a HellSpy ident: cached, limited, {} on failure."""
     if ident in _probe_cache:
         return _probe_cache[ident]
+    if time.monotonic() - _probe_failed.get(ident, -PROBE_RETRY_AFTER) < PROBE_RETRY_AFTER:
+        return {}
     if not _have_ffprobe():
         return {}
     try:
@@ -275,12 +287,15 @@ async def probe(client, ident: str) -> dict:
             info = probe_info(await _run_ffprobe(url), _link_extension(url))
     except asyncio.TimeoutError:
         logger.warning("ffprobe %s timed out after %ds", ident, PROBE_TIMEOUT)
+        _remember_failure(ident)
         return {}
     except Exception as exc:  # fail open: a probe must never break a search
         logger.warning("ffprobe %s failed: %s", ident, exc)
+        _remember_failure(ident)
         return {}
     if not (info["width"] or info["length"] or info["audio"]):
-        return {}  # nothing measured; ask again next time
+        _remember_failure(ident)
+        return {}  # nothing measured; ask again after PROBE_RETRY_AFTER
     if len(_probe_cache) >= PROBE_CACHE_MAX:
         _probe_cache.pop(next(iter(_probe_cache)))
     _probe_cache[ident] = info
