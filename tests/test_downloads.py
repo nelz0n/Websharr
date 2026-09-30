@@ -539,3 +539,11 @@ def test_finished_file_is_named_after_the_release(client, fake_webshare):
         assert (Path(raw.storage) / "Kaceri pribehy S01E19.avi").read_bytes() == payload
     finally:
         httpd.shutdown()
+
+
+def test_error_text_never_empty():
+    """httpx.ReadTimeout and friends have no message: the failure must still say what happened."""
+    import httpx
+    from app.downloads import describe_error
+    assert describe_error(httpx.ReadTimeout("")) == "ReadTimeout"
+    assert describe_error(WebshareError("File temporarily unavailable.")) == "File temporarily unavailable."
