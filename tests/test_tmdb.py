@@ -190,3 +190,109 @@ def test_runtime_resolves_an_imdb_id_once(monkeypatch):
     assert asyncio.run(tmdb.runtime("tok", "movie", imdbid="tt0114709")) == 81
     assert sum("/find/" in c for c in _RecordingClient.calls) == 1
     assert sum(c.endswith("/movie/862") for c in _RecordingClient.calls) == 1
+
+
+class _SeasonClient(_RecordingClient):
+    """Serves DuckTales (1987) season 1 in English and Czech, found by TVDB id."""
+
+    fail = False
+
+    async def get(self, url, params=None):
+        _SeasonClient.calls.append(url)
+        if _SeasonClient.fail:
+            raise tmdb.httpx.ConnectError("down")
+        if url.endswith("/find/75931"):
+            return _Resp({"tv_results": [{"id": 720, "name": "DuckTales"}]})
+        if url.endswith("/tv/720/season/1"):
+            cs = (params or {}).get("language") == "cs-CZ"
+            return _Resp({"episodes": [
+                {"episode_number": 1, "name": "Poklad zlatých sluncí" if cs else "Treasure of the Golden Suns (1)"},
+                {"episode_number": 6, "name": "Don't Give Up the Ship"},  # no cs translation
+            ]})
+        return _Resp({})
+
+
+def test_season_titles_fetched_once_per_season(monkeypatch):
+    """Every episode search of a season shares one season list (en + cs), and
+    the TMDB id behind the TVDB id is resolved once."""
+    monkeypatch.setattr(tmdb.httpx, "AsyncClient", _SeasonClient)
+    monkeypatch.setattr(tmdb, "_resolved", {})
+    monkeypatch.setattr(tmdb, "_season_cache", {})
+    _SeasonClient.calls, _SeasonClient.fail = [], False
+    for _ in range(3):
+        names = asyncio.run(tmdb.season_titles("tok", tvdbid="75931", season="1"))
+    assert names == {1: ("Treasure of the Golden Suns (1)", "Poklad zlatých sluncí"),
+                     6: ("Don't Give Up the Ship",)}
+    assert sum("/find/" in c for c in _SeasonClient.calls) == 1
+    assert sum(c.endswith("/season/1") for c in _SeasonClient.calls) == 2  # en + cs
+
+
+def test_season_titles_fail_open(monkeypatch):
+    monkeypatch.setattr(tmdb.httpx, "AsyncClient", _SeasonClient)
+    monkeypatch.setattr(tmdb, "_resolved", {})
+    monkeypatch.setattr(tmdb, "_season_cache", {})
+    _SeasonClient.calls, _SeasonClient.fail = [], True
+    assert asyncio.run(tmdb.season_titles("tok", tmdbid="720", season="1")) == {}
+    assert tmdb._season_cache == {}  # a failure is not remembered
+    _SeasonClient.fail = False
+    assert asyncio.run(tmdb.season_titles("tok", tvdbid="75931")) == {}  # no season
+    assert asyncio.run(tmdb.season_titles("", tvdbid="75931", season="1")) == {}
+
+
+class _NamesakeClient(_RecordingClient):
+    """DuckTales (2017) and its namesakes: DuckTales (1987) under both names,
+    an obscure same-named show and a show that merely starts with the name."""
+
+    fail = False
+
+    async def get(self, url, params=None):
+        _NamesakeClient.calls.append((url, dict(params or {})))
+        if _NamesakeClient.fail and "/search/" in url:
+            raise tmdb.httpx.ConnectError("down")
+        if url.endswith("/find/330134"):
+            return _Resp({"tv_results": [{"id": 72350, "name": "DuckTales", "original_name": "DuckTales",
+                                          "original_language": "en", "first_air_date": "2017-08-12"}]})
+        if url.endswith("/alternative_titles"):
+            return _Resp({"results": [{"iso_3166_1": "CZ", "title": "Kačeří příběhy"}]})
+        if url.endswith("/search/tv"):
+            cs = params.get("language") == "cs-CZ"
+            name = "Kačeří příběhy" if cs else "DuckTales"
+            return _Resp({"results": [
+                {"id": 72350, "name": name, "original_name": "DuckTales",
+                 "first_air_date": "2017-08-12", "vote_count": 329},
+                {"id": 720, "name": name, "original_name": "DuckTales",
+                 "first_air_date": "1987-09-18", "vote_count": 764},
+                {"id": 1, "name": "DuckTales", "original_name": "DuckTales",
+                 "first_air_date": "1970-01-01", "vote_count": 3},
+                {"id": 2, "name": "DuckTales: Remastered", "original_name": "DuckTales: Remastered",
+                 "first_air_date": "2013-08-13", "vote_count": 500},
+            ]})
+        return _Resp({"results": [], "translations": []})
+
+
+def _fresh_namesakes(monkeypatch, fail=False):
+    monkeypatch.setattr(tmdb.httpx, "AsyncClient", _NamesakeClient)
+    for cache in ("_cache", "_resolved", "_namesake_cache"):
+        monkeypatch.setattr(tmdb, cache, {})
+    _NamesakeClient.calls, _NamesakeClient.fail = [], fail
+
+
+def test_namesakes_finds_the_other_show_once(monkeypatch):
+    _fresh_namesakes(monkeypatch)
+    for _ in range(3):
+        found = asyncio.run(tmdb.namesakes("tok", tvdbid="330134"))
+    assert found == ((720, 1987, ("DuckTales", "Kačeří příběhy")),)
+    searches = [p for u, p in _NamesakeClient.calls if u.endswith("/search/tv")]
+    assert searches == [{"query": "DuckTales", "language": "en-US"},
+                        {"query": "Kačeří příběhy", "language": "cs-CZ"}]
+    assert sum("/find/" in u for u, _ in _NamesakeClient.calls) == 1
+
+
+def test_namesakes_fail_open(monkeypatch):
+    _fresh_namesakes(monkeypatch, fail=True)
+    assert asyncio.run(tmdb.namesakes("tok", tvdbid="330134")) == ()
+    assert tmdb._namesake_cache == {}  # a failure is not remembered
+    _NamesakeClient.fail = False
+    assert asyncio.run(tmdb.namesakes("tok", tvdbid="330134"))[0][0] == 720
+    assert asyncio.run(tmdb.namesakes("", tvdbid="330134")) == ()
+    assert asyncio.run(tmdb.namesakes("tok")) == ()

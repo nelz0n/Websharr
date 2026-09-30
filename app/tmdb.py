@@ -24,6 +24,7 @@ year (0 when unknown), used to reject files of a same-named other title — the
 """
 
 import logging
+import unicodedata
 
 import httpx
 
@@ -266,9 +267,9 @@ async def lookup_by_id(token: str, kind: str, tmdbid=None, imdbid=None,
     return found
 
 
-# What lookup_by_id already learned, so the runtime check doesn't ask TMDB again:
-# the TMDB id behind an external id, and the runtime from a full details entry
-# (a /find hit is a summary without one).
+# What lookup_by_id already learned, so the runtime and episode-name checks don't
+# ask TMDB again: the TMDB id behind an external id, and the runtime from a full
+# details entry (a /find hit is a summary without one).
 _CACHE_MAX = 2000
 _resolved: dict[tuple, int] = {}
 _runtime_cache: dict[tuple, int] = {}
@@ -297,6 +298,28 @@ def _remember(kind: str, ids: tuple, entry: dict) -> None:
         _put(_runtime_cache, (kind, tid, None, None), minutes)
 
 
+def _known_id(kind: str, tmdbid, imdb: str, tvdbid):
+    """The TMDB id a search's ids point at without asking TMDB: the given one,
+    or the one lookup_by_id (or an earlier /find) resolved; None otherwise."""
+    if tmdbid:
+        # *arr sends the id as a string, TMDB answers with an int: key caches by int
+        return int(tmdbid) if str(tmdbid).isdigit() else tmdbid
+    return _resolved.get((kind, tmdbid, tvdbid, imdb))
+
+
+async def _find_id(client, kind: str, tmdbid, imdb: str, tvdbid):
+    """The TMDB id behind a TVDB/IMDb id via /find, remembered for later checks."""
+    for ext, source in ((tvdbid, "tvdb_id"), (imdb, "imdb_id")):
+        if not ext:
+            continue
+        r = await client.get(f"{_BASE}/find/{ext}", params={"external_source": source})
+        hits = (r.json().get(f"{kind}_results") or []) if r.status_code == 200 else []
+        if hits and hits[0].get("id"):
+            _put(_resolved, (kind, tmdbid, tvdbid, imdb), hits[0]["id"])
+            return hits[0]["id"]
+    return None
+
+
 async def runtime(token: str, kind: str, tmdbid=None, imdbid=None, tvdbid=None,
                   season=None, ep=None) -> int:
     """Expected running time in minutes — of the movie, or of one episode — or 0
@@ -314,9 +337,7 @@ async def runtime(token: str, kind: str, tmdbid=None, imdbid=None, tvdbid=None,
     imdb = _imdb_id(imdbid)
     if not (tmdbid or imdb or tvdbid):
         return 0
-    # *arr sends the id as a string, TMDB answers with an int: key caches by int
-    tid = (int(tmdbid) if str(tmdbid).isdigit() else tmdbid) if tmdbid else \
-        _resolved.get((kind, tmdbid, tvdbid, imdb))
+    tid = _known_id(kind, tmdbid, imdb, tvdbid)
     episode = (season, ep) if kind == "tv" and season is not None and ep is not None else (None, None)
     if tid and (kind, tid, *episode) in _runtime_cache:
         return _runtime_cache[(kind, tid, *episode)]
@@ -324,14 +345,7 @@ async def runtime(token: str, kind: str, tmdbid=None, imdbid=None, tvdbid=None,
     try:
         async with httpx.AsyncClient(timeout=10.0, headers=_headers(token)) as client:
             if not tid:
-                for ext, source in ((tvdbid, "tvdb_id"), (imdb, "imdb_id")):
-                    if not ext:
-                        continue
-                    r = await client.get(f"{_BASE}/find/{ext}", params={"external_source": source})
-                    hits = (r.json().get(f"{kind}_results") or []) if r.status_code == 200 else []
-                    if hits:
-                        tid = hits[0].get("id")
-                        break
+                tid = await _find_id(client, kind, tmdbid, imdb, tvdbid)
             if not tid:
                 return 0
             if episode[0] is not None:
@@ -350,3 +364,136 @@ async def runtime(token: str, kind: str, tmdbid=None, imdbid=None, tvdbid=None,
         return 0
     _put(_runtime_cache, (kind, tid, *episode), minutes)
     return minutes
+
+
+# (TMDB id, season) -> {episode number: its names}; see season_titles.
+_season_cache: dict[tuple, dict[int, tuple[str, ...]]] = {}
+
+
+async def season_titles(token: str, tmdbid=None, imdbid=None, tvdbid=None,
+                        season=None) -> dict[int, tuple[str, ...]]:
+    """Episode number -> its names (English, then the Czech one when TMDB has a
+    translation) for one season of a show, or {} when unknown.
+
+    Uploads don't always number episodes the way TVDB/TMDB do: ZEPPELiN's
+    DuckTales follows the Disney+ order, which counts the five-part pilot as one
+    episode, so "Don't Give Up the Ship" is named S01E01. The episode name in the
+    file tells such a file apart. One season list serves every episode search of
+    that season; the TMDB id comes from what lookup_by_id/runtime resolved.
+    """
+    if not token or season is None:
+        return {}
+    try:
+        season = int(season)
+    except (TypeError, ValueError):
+        return {}
+    imdb = _imdb_id(imdbid)
+    if not (tmdbid or imdb or tvdbid):
+        return {}
+    tid = _known_id("tv", tmdbid, imdb, tvdbid)
+    if tid and (tid, season) in _season_cache:
+        return _season_cache[(tid, season)]
+    names: dict[int, tuple[str, ...]] = {}
+    try:
+        async with httpx.AsyncClient(timeout=10.0, headers=_headers(token)) as client:
+            if not tid:
+                tid = await _find_id(client, "tv", tmdbid, imdb, tvdbid)
+            if not tid:
+                return {}
+            if (tid, season) in _season_cache:
+                return _season_cache[(tid, season)]
+            for language in ("en-US", "cs-CZ"):
+                r = await client.get(f"{_BASE}/tv/{tid}/season/{season}", params={"language": language})
+                if r.status_code != 200:
+                    if language == "en-US":
+                        return {}  # not cached: may be a passing failure
+                    continue
+                for e in r.json().get("episodes") or []:
+                    num, name = e.get("episode_number"), (e.get("name") or "").strip()
+                    have = names.get(num, ())
+                    # a missing cs translation comes back as the English name again
+                    if isinstance(num, int) and name and name.casefold() not in {x.casefold() for x in have}:
+                        names[num] = (*have, name)
+    except (httpx.HTTPError, KeyError, ValueError, TypeError, AttributeError) as exc:
+        logger.warning("TMDB season %s of tv (tmdb=%s tvdb=%s imdb=%s) failed: %s",
+                       season, tmdbid, tvdbid, imdb, exc)
+        return {}
+    _put(_season_cache, (tid, season), names)
+    return names
+
+
+# TMDB id of a show -> its namesakes; see namesakes().
+_namesake_cache: dict = {}
+# A namesake with fewer votes than this is too obscure to be on Webshare or in a
+# library ("Bluey", a 1976 Australian police drama with 5 votes, vs the cartoon).
+_NAMESAKE_MIN_VOTES = 20
+
+
+def _norm(text: str) -> str:
+    """Lowercase, no diacritics, punctuation as spaces: how names are compared."""
+    text = unicodedata.normalize("NFKD", (text or "").lower())
+    text = "".join(c if c.isalnum() else " " for c in text if not unicodedata.combining(c))
+    return " ".join(text.split())
+
+
+async def namesakes(token: str, tmdbid=None, imdbid=None, tvdbid=None
+                    ) -> tuple[tuple[int, int, tuple[str, ...]], ...]:
+    """Other TMDB shows that share a name we search this show under, as
+    (TMDB id, first-air year or 0, the shared names), or () when none/unknown.
+
+    DuckTales (1987) and DuckTales (2017) are both "DuckTales" and both
+    "Kačeří příběhy" on Webshare, and the file names carry no year: a 2017
+    search released 1987 episodes, and "DuckTales S01E16" made Sonarr import
+    2017 episodes under the 1987 show. The display name is searched in English,
+    the Czech names in Czech; a result with another id whose name or original
+    name equals one of ours is a namesake. Cached per show (failures are not);
+    any TMDB error means "no namesakes", i.e. the behaviour without this check.
+    """
+    if not token:
+        return ()
+    imdb = _imdb_id(imdbid)
+    if not (tmdbid or imdb or tvdbid):
+        return ()
+    found = await lookup_by_id(token, "tv", tmdbid, imdbid, tvdbid)
+    if not found:
+        return ()
+    disp, orig, _lang, czech, _first_air = found
+    tid = _known_id("tv", tmdbid, imdb, tvdbid)
+    if tid and tid in _namesake_cache:
+        return _namesake_cache[tid]
+    ours = {_norm(t): t for t in (disp, orig, *czech) if _norm(t)}
+    shared: dict[int, list[str]] = {}
+    years: dict[int, int] = {}
+    try:
+        async with httpx.AsyncClient(timeout=10.0, headers=_headers(token)) as client:
+            if not tid:
+                tid = await _find_id(client, "tv", tmdbid, imdb, tvdbid)
+            if not tid:
+                return ()
+            if tid in _namesake_cache:
+                return _namesake_cache[tid]
+            searches = ([(disp, "en-US")] if disp else []) + [(t, "cs-CZ") for t in czech]
+            for query, language in searches:
+                r = await client.get(f"{_BASE}/search/tv", params={"query": query, "language": language})
+                if r.status_code != 200:
+                    logger.warning("TMDB search %r (%s) for namesakes: HTTP %s", query, language, r.status_code)
+                    return ()  # not cached: may be a passing failure
+                for e in r.json().get("results") or []:
+                    oid = e.get("id")
+                    if not oid or oid == tid or (e.get("vote_count") or 0) < _NAMESAKE_MIN_VOTES:
+                        continue
+                    for name in (e.get("name"), e.get("original_name")):
+                        title = ours.get(_norm(name))
+                        if title and title not in shared.get(oid, []):
+                            shared.setdefault(oid, []).append(title)
+                            years[oid] = _year(e)
+    except (httpx.HTTPError, KeyError, ValueError, TypeError, AttributeError) as exc:
+        logger.warning("TMDB namesakes of tv (tmdb=%s tvdb=%s imdb=%s) failed: %s",
+                       tmdbid, tvdbid, imdb, exc)
+        return ()
+    result = tuple((oid, years[oid], tuple(names)) for oid, names in shared.items())
+    _put(_namesake_cache, tid, result)
+    if result:
+        logger.info("TMDB: tv %s %r shares its name with %s", tid, disp,
+                    ", ".join(f"{oid} ({year or '?'}: {', '.join(names)})" for oid, year, names in result))
+    return result
