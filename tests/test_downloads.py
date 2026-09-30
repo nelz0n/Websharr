@@ -222,7 +222,8 @@ def test_dropped_connection_resumes_instead_of_failing(client, fake_webshare, mo
         manager = app.state.downloads
         assert wait_for(lambda: (j := manager.get(nzo_id)) and j.status == "completed")
         job = manager.get(nzo_id)
-        assert (Path(job.storage) / FILE_NAME).read_bytes() == payload
+        (final,) = Path(job.storage).iterdir()  # one finished file, whatever it is named
+        assert final.read_bytes() == payload
         # continued from what was on disk each time, not from zero
         assert handler.ranges[0] is None and len(handler.ranges) == 3
         assert all(r and r.startswith("bytes=") and r != "bytes=0-" for r in handler.ranges[1:])
@@ -334,7 +335,8 @@ def test_dead_link_falls_back_to_identical_copy(client, fake_webshare, monkeypat
         assert wait_for(lambda: manager.get(nzo_id).status == "completed")
         job = manager.get(nzo_id)
         assert asked == ["dead1", "dead2", "good3"]
-        assert (Path(job.storage) / FILE_NAME).read_bytes() == PAYLOAD
+        (final,) = Path(job.storage).iterdir()
+        assert final.read_bytes() == PAYLOAD
         # The copy in use is persisted; the original stays on record.
         assert job.ident == "good3"
         assert job.alternates == ["dead1", "dead2", "spare4"]

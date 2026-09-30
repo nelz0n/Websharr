@@ -347,8 +347,9 @@ def test_hs_download_uses_the_hellspy_client(client, fake_webshare, fake_hellspy
         assert wait_for(lambda: manager.get(nzo_id).status == "completed")
         job = manager.get(nzo_id)
         assert job.ident == "hs:1:aa" and fake_hellspy.links_asked == ["hs:1:aa"]
-        # the link names the original upload: .mp4, not the search's placeholder
-        assert (Path(job.storage) / "Bluey S01E02.mp4").read_bytes() == PAYLOAD
+        # the link names the original upload: .mp4, not the search's placeholder;
+        # the file takes the release title
+        assert (Path(job.storage) / "Bluey S01E02 - Bluey.mp4").read_bytes() == PAYLOAD
     finally:
         httpd.shutdown()
 
