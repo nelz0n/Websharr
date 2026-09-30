@@ -2,7 +2,8 @@
 
 Exposes a Torznab indexer (/torznab/api), a SABnzbd-compatible download
 client (/sabnzbd/api) and a monitoring web UI (/ui) so Sonarr/Radarr can
-search and download from a Webshare.cz premium account.
+search and download from a Webshare.cz premium account — and optionally from
+HellSpy through a second indexer (/hellspy/api).
 """
 
 import asyncio
@@ -19,6 +20,7 @@ from . import applog
 from . import notify
 from .config import config
 from .downloads import DownloadManager
+from .hellspy import HellspyClient
 from .sabnzbd import router as sabnzbd_router
 from .settings import settings
 from .torznab import router as torznab_router
@@ -60,6 +62,9 @@ async def lifespan(app: FastAPI):
             logger.info("Migrated stored Webshare password to a login digest")
         except Exception as exc:
             logger.warning("Webshare password not migrated to digest yet: %s", exc)
+    # Always created (it needs no account): queued HellSpy downloads keep
+    # working when the indexer endpoint is switched off.
+    hellspy = HellspyClient(search_cache_ttl=config.search_cache_ttl)
     manager = DownloadManager(
         client=client,
         complete_dir=config.complete_dir,
@@ -68,11 +73,13 @@ async def lifespan(app: FastAPI):
         max_concurrent=settings.max_concurrent,
         notify=_send_notification,
         categories=settings.categories,
+        hellspy_client=hellspy,
     )
     manager.ensure_dirs()
     manager.load_state()
     manager.resume_pending()
     app.state.webshare = client
+    app.state.hellspy = hellspy
     app.state.downloads = manager
     app.state.account = None
     app.state.account_ts = 0.0
@@ -85,6 +92,7 @@ async def lifespan(app: FastAPI):
     await asyncio.gather(monitor_task, return_exceptions=True)
     await manager.shutdown()
     await client.close()
+    await hellspy.close()
 
 
 async def _send_notification(title: str, body: str) -> None:

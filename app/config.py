@@ -60,6 +60,8 @@ class Config:
         # Websharr's own release-title tags (CZaudio, SKaudio, CZunverified,
         # LowBitrate) for custom formats; off unless enabled here or in the UI.
         self.release_tags = os.environ.get("RELEASE_TAGS", "").strip().lower() in ("1", "true", "yes", "on")
+        # HellSpy as a second source at /hellspy/api; off unless enabled here or in the UI.
+        self.hellspy_enabled = os.environ.get("HELLSPY_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
         self.log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 

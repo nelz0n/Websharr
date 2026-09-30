@@ -199,6 +199,30 @@ A custom format to import (Settings → Custom Formats → Import), one per tag:
 }
 ```
 
+## HellSpy (optional second source)
+
+[HellSpy](https://hellspy.to) is a free Czech video host — no account needed.
+Enable it in **Settings → HellSpy** (or `HELLSPY_ENABLED=1`) and add it in
+Prowlarr as a **second Generic Newznab** indexer: URL `http://websharr:9797`,
+API Path `/hellspy/api`, the same API key. Being its own indexer, it gets its own
+priority and tags; grabs go to the same SABnzbd download client. While disabled,
+`/hellspy/api` answers with a Newznab error (910).
+
+The search, filters, TMDB title/runtime checks and duplicate merging are the
+Webshare ones. HellSpy only offers transcodes besides the original, so Websharr
+always downloads the **original upload** and measures it with **ffprobe** (in
+the image; it reads only the file headers): resolution, video codec, duration and
+every audio track's codec, channels and language — the same data as Webshare's
+probe, so the same title tokens and language attrs. Not known: HDR/DV, bit depth
+and the source, as on Webshare; HellSpy's search has no file extension (the
+download takes it from the link), no votes and no password flag. A probe takes
+about a second (three at a time), so a new search is slower the first time;
+results are cached per file.
+
+HellSpy's [terms](https://hellspy.to/terms-and-conditions) forbid overloading the
+service with automated requests, so Websharr caches searches and caps parallel
+API calls and probes.
+
 ## Monitoring and notifications
 
 - **Health check.** `GET /health` (no API key) returns `200` when the download
@@ -238,6 +262,7 @@ A custom format to import (Settings → Custom Formats → Import), one per tag:
 | `SEARCH_LIMIT` | `60` | max results from Webshare per query |
 | `SEARCH_CACHE_TTL` | `600` | seconds an identical Webshare search is answered from memory; `0` disables |
 | `RELEASE_TAGS` | off | add Websharr's own release tags (`CZaudio`, `CZunverified`, `LowBitrate`…); also in Settings |
+| `HELLSPY_ENABLED` | off | serve [HellSpy](#hellspy-optional-second-source) at `/hellspy/api`; also in Settings |
 
 Sonarr and Radarr repeat the same searches (per episode, per season, on retry),
 so Websharr answers an identical Webshare search from memory for

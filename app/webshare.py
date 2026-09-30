@@ -82,11 +82,12 @@ class WebshareError(Exception):
 
 
 class SearchResult:
-    __slots__ = ("ident", "name", "size", "positive_votes", "negative_votes", "password", "type")
+    __slots__ = ("ident", "name", "size", "positive_votes", "negative_votes", "password", "type",
+                 "duration")
 
     def __init__(self, ident: str, name: str, size: int,
                  positive_votes: int = 0, negative_votes: int = 0, password: bool = False,
-                 type: str = ""):
+                 type: str = "", duration: int = 0):
         self.ident = ident
         self.name = name
         self.size = size
@@ -94,6 +95,8 @@ class SearchResult:
         self.negative_votes = negative_votes
         self.password = password
         self.type = type  # container reported by Webshare, e.g. "mkv"
+        # Seconds, when the search itself knows it (HellSpy); 0 = ask the probe.
+        self.duration = duration
 
 
 def _parse_response(text: str) -> ET.Element:

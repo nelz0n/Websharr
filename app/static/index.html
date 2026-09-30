@@ -907,6 +907,24 @@
 
     <div class="scard">
       <div class="sinfo">
+        <h3>HellSpy</h3>
+        <p class="shint">An optional second source — no account needed. Add it in
+          Prowlarr as another <b>Generic Newznab</b> indexer with API path
+          <b>/hellspy/api</b> (same API key) and give it its own priority. Quality is
+          measured with ffprobe. Downloads go through the same client.</p>
+      </div>
+      <div class="sform">
+        <label class="scheck"><input id="set-hellspy" type="checkbox"> Enable the HellSpy indexer</label>
+        <div class="srow">
+          <div class="spacer"></div>
+          <button class="primary" id="set-hellspy-save">Save</button>
+        </div>
+        <span class="sresult" id="set-hellspy-result"></span>
+      </div>
+    </div>
+
+    <div class="scard">
+      <div class="sinfo">
         <h3>Search aliases</h3>
         <p class="shint">Manual override/supplement to the TMDB lookup. Map
           <b>*arr title → Webshare (Czech) title</b> and Websharr also searches the
@@ -1170,6 +1188,7 @@ const App = {
       $("set-notify-urls").value = (s.notify_urls || []).join("\n");
       $("set-vip-days").value = s.notify_vip_days ?? 7;
       $("set-release-tags").checked = !!s.release_tags;
+      $("set-hellspy").checked = !!s.hellspy_enabled;
       this.renderVip(s.account);
       $("set-tmdb-token").value = "";
       $("set-tmdb-token").placeholder = s.tmdb_token_set
@@ -1833,6 +1852,12 @@ $("set-tags-save").onclick = async () => {
     await uiPost("settings", { release_tags: $("set-release-tags").checked });
     sresult("set-tags-result", true, "✓ Saved");
   } catch (e) { sresult("set-tags-result", false, e.message); }
+};
+$("set-hellspy-save").onclick = async () => {
+  try {
+    await uiPost("settings", { hellspy_enabled: $("set-hellspy").checked });
+    sresult("set-hellspy-result", true, "✓ Saved");
+  } catch (e) { sresult("set-hellspy-result", false, e.message); }
 };
 $("set-notify-test").onclick = async () => {
   sresult("set-notify-result", true, "Sending…");

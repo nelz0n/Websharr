@@ -67,6 +67,25 @@ class FakeWebshareClient:
         pass
 
 
+class FakeHellspyClient:
+    """Stand-in for HellspyClient: canned search results and links, never the network."""
+
+    def __init__(self, search_cache_ttl: float = 0):
+        self.results: list[SearchResult] = []
+        self.file_link_url = "http://127.0.0.1:1/file?fn=x.mkv"  # unreachable by default
+        self.links_asked: list[str] = []
+
+    async def search(self, query: str, limit: int = 60, offset: int = 0):
+        return list(self.results)
+
+    async def file_link(self, ident: str) -> str:
+        self.links_asked.append(ident)
+        return self.file_link_url
+
+    async def close(self):
+        pass
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "api_key", "testkey")
@@ -75,6 +94,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "state_file", tmp_path / "state.json")
     monkeypatch.setattr(config, "settings_file", tmp_path / "settings.json")
     monkeypatch.setattr(app_main, "WebshareClient", FakeWebshareClient)
+    monkeypatch.setattr(app_main, "HellspyClient", FakeHellspyClient)
 
     with TestClient(app) as tc:
         yield tc
@@ -83,6 +103,11 @@ def client(tmp_path, monkeypatch):
 @pytest.fixture
 def fake_webshare(client) -> FakeWebshareClient:
     return app.state.webshare
+
+
+@pytest.fixture
+def fake_hellspy(client) -> FakeHellspyClient:
+    return app.state.hellspy
 
 
 def wait_for(predicate, timeout: float = 5.0) -> bool:

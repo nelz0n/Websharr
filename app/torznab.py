@@ -4,6 +4,9 @@ Mounted at /torznab/api. Supports t=caps, t=search, t=tvsearch, t=movie.
 Only q-based queries are advertised (Webshare search is filename-based, so
 imdbid/tvdbid lookups are not possible).
 
+/hellspy/api is the same indexer over HellSpy (optional second source), so
+Prowlarr adds it separately with its own priority and tags.
+
 Add this to Sonarr/Radarr as a **Newznab** indexer, not Torznab: the paired
 download client is SABnzbd (usenet protocol), and Sonarr only routes a grab
 to a usenet client when the release came from a usenet (Newznab) indexer.
@@ -24,6 +27,8 @@ import httpx
 from fastapi import APIRouter, Request, Response
 
 from .config import config
+from .hellspy import HellspyError
+from .hellspy import probe as hellspy_probe
 from .nzb import build_nzb
 from .settings import settings
 from .tmdb import lookup as tmdb_lookup
@@ -136,9 +141,9 @@ def _error(code: int, description: str) -> Response:
     return _xml_response(el)
 
 
-def _caps() -> Response:
+def _caps(title: str = "Websharr") -> Response:
     caps = ET.Element("caps")
-    ET.SubElement(caps, "server", {"title": "Websharr", "version": "1.0"})
+    ET.SubElement(caps, "server", {"title": title, "version": "1.0"})
     ET.SubElement(caps, "limits", {"max": "100", "default": str(config.search_limit)})
     # Advertise id params so Sonarr/Radarr (via Prowlarr) send tvdbid/imdbid/
     # tmdbid — Websharr resolves them to the exact Czech title via TMDB instead
@@ -313,14 +318,16 @@ async def _file_info(client, ident: str) -> dict:
     return {}
 
 
-async def _probe(client, results: list[SearchResult], all_files: bool = False
+async def _probe(file_info, results: list[SearchResult], all_files: bool = False
                  ) -> tuple[dict[str, int], dict[str, str], dict[str, int], dict[str, dict]]:
-    """Fetch file_info for results whose *name* leaves something open, and
+    """Fetch file_info (the source's `file_info(ident)`, {} when unknown) for
+    results whose *name* leaves something open, and
     return (heights, audio, lengths): the video height for names without a
     resolution token — many CZ files ship without one and Sonarr/Radarr reject
     them as 'Unknown' quality otherwise — "Czech"/"Slovak" for names without a
     language marker whose audio track says so (a TV-rip dub named just
-    "... 1080p WEB-DL prima+"), and the duration in seconds of every probed file.
+    "... 1080p WEB-DL prima+"), and the duration in seconds of every probed file
+    (the search's own duration when the probe has none).
     `all_files` probes every result (for the runtime check), not just those."""
     need = results if all_files else \
         [r for r in results if not _RES_RE.search(r.name) or not dub_language(r.name)]
@@ -328,7 +335,7 @@ async def _probe(client, results: list[SearchResult], all_files: bool = False
         return {}, {}, {}, {}
 
     async def one(r: SearchResult):
-        return r, await _file_info(client, r.ident)
+        return r, await file_info(r.ident)
 
     heights: dict[str, int] = {}
     audio: dict[str, str] = {}
@@ -337,8 +344,9 @@ async def _probe(client, results: list[SearchResult], all_files: bool = False
     for r, info in await asyncio.gather(*(one(r) for r in need)):
         if info:
             infos[r.ident] = info
-        if int(info.get("length") or 0) > 0:
-            lengths[r.ident] = int(info["length"])
+        length = int(info.get("length") or 0) or r.duration
+        if length > 0:
+            lengths[r.ident] = length
         height = resolution_class(int(info.get("width") or 0), int(info.get("height") or 0))
         if height and not _RES_RE.search(r.name):
             heights[r.ident] = height
@@ -924,8 +932,9 @@ def _render_feed(request: Request, results: list[SearchResult], category: str,
         # The saved file keeps the raw filename; the folder/title (nzbname) carries
         # the parseable SxxEyy so *arr import works. Pass the title as nzbname so a
         # direct GET of this link (or SAB addurl) names the job correctly.
+        # quote(): a HellSpy ident ("hs:<id>:<hash>") carries colons
         link = (
-            f"{base}/torznab/nzb/{r.ident}"
+            f"{base}/torznab/nzb/{urllib.parse.quote(r.ident, safe='')}"
             f"?apikey={config.api_key}"
             f"&name={urllib.parse.quote(_asciify(r.name))}&size={r.size}"
             f"&nzbname={urllib.parse.quote(title)}"
@@ -974,15 +983,48 @@ def _render_feed(request: Request, results: list[SearchResult], category: str,
     return _xml_response(rss)
 
 
+class Source:
+    """Where an indexer endpoint's files come from: `search(query, limit=,
+    offset=)` returning SearchResults, `file_info(ident)` returning the
+    measured file_info dict ({} when unknown, never raising), and the names
+    the caps and error messages use. Everything else is shared."""
+
+    __slots__ = ("title", "label", "search", "file_info")
+
+    def __init__(self, title: str, label: str, search, file_info):
+        self.title = title
+        self.label = label
+        self.search = search
+        self.file_info = file_info
+
+
 @router.get("/torznab/api")
 async def torznab_api(request: Request):
+    client = request.app.state.webshare
+    return await _newznab(request, Source(
+        "Websharr", "Webshare", client.search, lambda ident: _file_info(client, ident)))
+
+
+@router.get("/hellspy/api")
+async def hellspy_api(request: Request):
+    if request.query_params.get("apikey") != config.api_key:
+        return _error(100, "Invalid API key")
+    if not settings.hellspy_enabled:
+        # Newznab 910 "API disabled": Prowlarr shows it instead of a failure
+        return _error(910, "HellSpy is disabled - enable it in Websharr Settings or with HELLSPY_ENABLED=1")
+    client = request.app.state.hellspy
+    return await _newznab(request, Source(
+        "Websharr HellSpy", "HellSpy", client.search, lambda ident: hellspy_probe(client, ident)))
+
+
+async def _newznab(request: Request, source: Source):
     params = request.query_params
     if params.get("apikey") != config.api_key:
         return _error(100, "Invalid API key")
 
     t = params.get("t", "caps")
     if t == "caps":
-        return _caps()
+        return _caps(source.title)
     if t not in ("search", "tvsearch", "movie"):
         return _error(203, f"Function '{t}' not available")
 
@@ -1019,16 +1061,15 @@ async def torznab_api(request: Request):
 
     want_ep = int(ep) if (t == "tvsearch" and ep and str(ep).isdigit()) else None
     want_season = int(season) if (t == "tvsearch" and season and str(season).isdigit()) else None
-    client = request.app.state.webshare
     seen: set[str] = set()
     merged: list[SearchResult] = []
     episodes: dict[str, int] = {}  # season search: each file's own episode number
     for query in queries:
         try:
-            results = await client.search(query, limit=limit, offset=offset)
-        except (WebshareError, httpx.HTTPError) as exc:
-            logger.error("Search '%s' failed: %s", query, exc)
-            return _error(900, f"Webshare search failed: {exc}")
+            results = await source.search(query, limit=limit, offset=offset)
+        except (WebshareError, HellspyError, httpx.HTTPError) as exc:
+            logger.error("%s search '%s' failed: %s", source.label, query, exc)
+            return _error(900, f"{source.label} search failed: {exc}")
         for r in results:
             if r.ident in seen or r.password or not _is_video(r.name):
                 continue
@@ -1060,7 +1101,7 @@ async def torznab_api(request: Request):
     if found > len(merged):
         logger.info("Merged %d duplicate uploads into %d releases", found - len(merged), len(alternates))
     merged.sort(key=lambda r: (-relevance(queries, r.name), -r.size))
-    logger.info("Newznab %s q=%r -> %d results", t, q, len(merged))
+    logger.info("Newznab %s q=%r -> %d %s results", t, q, len(merged), source.label)
     # With an exact id, TMDB knows how long the title runs; files far off that
     # are another title that shares the name, a special or an excerpt.
     minutes = 0
@@ -1076,7 +1117,7 @@ async def torznab_api(request: Request):
     shown = merged[:limit * 2] if minutes else merged[:limit]
     # file_info is cheap and cached: probe every shown file, the measured
     # resolution/codec/audio feed the release title and language attrs.
-    heights, audio, lengths, infos = await _probe(client, shown, all_files=True)
+    heights, audio, lengths, infos = await _probe(source.file_info, shown, all_files=True)
     shown = [r for r in shown if not is_torso(r.size, lengths.get(r.ident, 0))]
     if minutes:
         kept = []

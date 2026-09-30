@@ -187,6 +187,7 @@ async def ui_settings_get(request: Request):
         "categories": settings.categories,
         "theme": settings.theme,
         "release_tags": settings.release_tags,
+        "hellspy_enabled": settings.hellspy_enabled,
         "account": getattr(request.app.state, "account", None),
     }
 
@@ -282,6 +283,10 @@ async def ui_settings_post(request: Request):
         if not isinstance(body.get("release_tags"), bool):
             return JSONResponse({"error": "release_tags must be true or false"}, status_code=400)
         settings.release_tags = body.get("release_tags")
+    if "hellspy_enabled" in body:
+        if not isinstance(body.get("hellspy_enabled"), bool):
+            return JSONResponse({"error": "hellspy_enabled must be true or false"}, status_code=400)
+        settings.hellspy_enabled = body.get("hellspy_enabled")
     if "theme" in body:
         theme = body.get("theme")
         if theme not in THEMES:

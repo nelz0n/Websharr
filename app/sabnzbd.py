@@ -144,14 +144,15 @@ async def _extract_nzb_payload(request: Request, params
             return None
         parsed = urllib.parse.urlparse(url)
         qs = urllib.parse.parse_qs(parsed.query)
-        name = qs.get("name", [m.group(1)])[0]
+        ident = urllib.parse.unquote(m.group(1))  # "hs%3A1%3Aab" for a HellSpy file
+        name = qs.get("name", [ident])[0]
         try:
             size = int(qs.get("size", ["0"])[0])
         except ValueError:
             size = 0
         title = (params.get("nzbname") or qs.get("nzbname", [""])[0] or "").strip()
         alternates = [a for a in qs.get("alt", [""])[0].split(",") if a]
-        return m.group(1), name, size, title, alternates
+        return ident, name, size, title, alternates
 
     form = await request.form()
     for key in ("nzbfile", "name"):

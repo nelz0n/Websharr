@@ -1,4 +1,5 @@
-"""Download manager: queues Webshare downloads and tracks SABnzbd-style state.
+"""Download manager: queues Webshare (and HellSpy) downloads and tracks
+SABnzbd-style state.
 
 Jobs persist to a JSON state file so history survives restarts; jobs that were
 still downloading are re-queued on startup and resume from the partial file in
@@ -16,6 +17,8 @@ from pathlib import Path
 
 import httpx
 
+from . import hellspy
+from .hellspy import HellspyError
 from .nzb import sanitize_filename
 from .webshare import WebshareClient, WebshareError
 
@@ -76,8 +79,10 @@ class Job:
 class DownloadManager:
     def __init__(self, client: WebshareClient, complete_dir: Path, incomplete_dir: Path,
                  state_file: Path, max_concurrent: int = 2, notify=None,
-                 categories: list[str] | None = None):
+                 categories: list[str] | None = None, hellspy_client=None):
         self._client = client
+        # Resolves "hs:" idents (see _file_link); None = HellSpy jobs fail.
+        self._hellspy = hellspy_client
         self._complete_dir = complete_dir
         self._incomplete_dir = incomplete_dir
         self._state_file = state_file
@@ -328,7 +333,7 @@ class DownloadManager:
         except asyncio.CancelledError:
             logger.info("Cancelled %s", job.nzo_id)
             raise
-        except (WebshareError, httpx.HTTPError, OSError) as exc:
+        except (WebshareError, HellspyError, httpx.HTTPError, OSError) as exc:
             job.status = "failed"
             job.error = str(exc)
             job.completed_ts = time.time()
@@ -367,11 +372,17 @@ class DownloadManager:
         # and lets *arr blocklist the release (see torznab._pub_date) and grab
         # another one.
         try:
-            url = await self._client.file_link(job.ident)
-        except WebshareError as exc:
+            url = await self._file_link(job.ident)
+        except (WebshareError, HellspyError) as exc:
             if offset or not job.alternates:
                 raise
             url = await self._copy_link(job, exc)
+        if not offset and hellspy.is_hellspy(job.ident):
+            # HellSpy search knows no extension; the signed link names the upload.
+            name = sanitize_filename(hellspy.file_name(url, job.name))
+            if name != job.name:
+                job.name, target = name, work_dir / name
+                self._save_state()
 
         work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -402,13 +413,22 @@ class DownloadManager:
         job.storage = str(final_dir)
         job.size = max(job.size, job.downloaded)
 
-    async def _copy_link(self, job: Job, exc: WebshareError) -> str:
+    async def _file_link(self, ident: str) -> str:
+        """Download link from the source the ident belongs to."""
+        if hellspy.is_hellspy(ident):
+            if self._hellspy is None:
+                raise HellspyError("HellSpy client not available")
+            return await self._hellspy.file_link(ident)
+        return await self._client.file_link(ident)
+
+    async def _copy_link(self, job: Job, exc: Exception) -> str:
         """Link of the first identical copy that has one; the job switches to
-        it for good (persisted, so a restart resumes the same upload)."""
+        it for good (persisted, so a restart resumes the same upload). Copies
+        come from the same indexer endpoint, so from the same source."""
         for alt in job.alternates:
             try:
-                url = await self._client.file_link(alt)
-            except WebshareError:
+                url = await self._file_link(alt)
+            except (WebshareError, HellspyError):
                 continue
             logger.info("Link of %s dead (%s), downloading identical copy %s",
                         job.ident, exc, alt)
@@ -416,7 +436,7 @@ class DownloadManager:
             job.ident = alt
             self._save_state()
             return url
-        raise WebshareError(f"{exc} ({len(job.alternates) + 1} copies tried)") from exc
+        raise type(exc)(f"{exc} ({len(job.alternates) + 1} copies tried)") from exc
 
     @staticmethod
     async def _stream_to_file(job: Job, resp: httpx.Response, target: Path, offset: int) -> None:
