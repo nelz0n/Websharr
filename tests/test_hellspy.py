@@ -353,6 +353,32 @@ def test_hs_download_uses_the_hellspy_client(client, fake_webshare, fake_hellspy
         httpd.shutdown()
 
 
+def test_hs_dropped_connection_resumes_through_hellspy(client, fake_webshare, fake_hellspy, monkeypatch):
+    """A dropped HellSpy download is resumed with a fresh HellSpy link, never a
+    Webshare one."""
+    from .test_downloads import _serve_dropping
+
+    async def no_webshare(ident):
+        raise AssertionError("a HellSpy ident went to Webshare")
+
+    monkeypatch.setattr(fake_webshare, "file_link", no_webshare)
+    payload = bytes(range(256)) * 16_384  # 4 MiB, bigger than the write chunk
+    httpd, handler = _serve_dropping(payload, drop_at=1_500_000, drops=1)
+    try:
+        port = httpd.server_address[1]
+        fake_hellspy.file_link_url = f"http://127.0.0.1:{port}/file?token=t&fn=Film.mkv"
+        feed_link = (f"http://testserver/torznab/nzb/{urllib.parse.quote('hs:9:bb', safe='')}"
+                     f"?apikey=testkey&name=Film.mkv&size={len(payload)}")
+        nzo_id = client.get("/sabnzbd/api", params={
+            "mode": "addurl", "apikey": "testkey", "cat": "movies", "name": feed_link}).json()["nzo_ids"][0]
+        manager = client.app.state.downloads
+        assert wait_for(lambda: manager.get(nzo_id).status == "completed")
+        assert fake_hellspy.links_asked == ["hs:9:bb", "hs:9:bb"]
+        assert (Path(manager.get(nzo_id).storage) / "Film.mkv").read_bytes() == payload
+    finally:
+        httpd.shutdown()
+
+
 def test_hs_dead_link_falls_back_to_a_copy(client, fake_hellspy, monkeypatch):
     from .test_downloads import PAYLOAD, _serve
 

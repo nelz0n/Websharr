@@ -426,7 +426,7 @@ class DownloadManager:
                     logger.warning("Download %s interrupted at %d bytes (%s); resuming, attempt %d/%d",
                                    job.nzo_id, offset, exc, interruptions, RESUME_ATTEMPTS)
                     await asyncio.sleep(RESUME_DELAYS[min(interruptions, len(RESUME_DELAYS)) - 1])
-                    url = await self._client.file_link(job.ident)
+                    url = await self._file_link(job.ident)
                     continue
                 break
 
