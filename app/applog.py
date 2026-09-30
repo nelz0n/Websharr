@@ -36,16 +36,18 @@ def redact(text: str) -> str:
 
 
 class RedactSecrets(logging.Filter):
-    """Rewrite a record's message with secret query parameters masked."""
+    """Mask secret query parameters in a record's message and arguments.
+
+    The arguments are rewritten in place, not folded into the message:
+    uvicorn's AccessFormatter unpacks the five access-log args itself."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            message = record.getMessage()
-        except Exception:  # noqa: BLE001 — never let logging break the app
-            return True
-        masked = redact(message)
-        if masked != message:
-            record.msg, record.args = masked, ()
+        if isinstance(record.msg, str):
+            record.msg = redact(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(redact(a) if isinstance(a, str) else a for a in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {k: redact(v) if isinstance(v, str) else v for k, v in record.args.items()}
         return True
 
 

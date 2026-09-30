@@ -34,3 +34,16 @@ def test_access_log_line_is_masked_for_every_handler():
         access.removeHandler(grab)
     assert seen and "secret123" not in seen[-1] and "apikey=***" in seen[-1]
     assert not any("secret123" in r["message"] for r in applog.records())
+
+
+def test_uvicorn_access_formatter_still_works():
+    """uvicorn formats access lines itself from the five args: masking must keep
+    them (an empty args tuple broke every access-log line)."""
+    from uvicorn.logging import AccessFormatter
+
+    record = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, '%s - "%s %s HTTP/%s" %d',
+                               ("172.19.0.16:1", "GET", "/sabnzbd/api?mode=queue&apikey=secret9", "1.1", 200),
+                               None)
+    applog.RedactSecrets().filter(record)
+    line = AccessFormatter('%(client_addr)s - "%(request_line)s" %(status_code)s').format(record)
+    assert "secret9" not in line and "apikey=***" in line and "200" in line
