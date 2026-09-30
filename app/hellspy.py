@@ -290,7 +290,7 @@ async def probe(client, ident: str) -> dict:
         _remember_failure(ident)
         return {}
     except Exception as exc:  # fail open: a probe must never break a search
-        logger.warning("ffprobe %s failed: %s", ident, exc)
+        logger.warning("ffprobe %s failed: %s", ident, str(exc).strip() or type(exc).__name__)
         _remember_failure(ident)
         return {}
     if not (info["width"] or info["length"] or info["audio"]):
