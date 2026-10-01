@@ -293,6 +293,8 @@ def _remember(kind: str, ids: tuple, entry: dict) -> None:
     if not tid:
         return
     _put(_resolved, (kind, *ids), tid)
+    if kind == "movie" and "belongs_to_collection" in entry:  # details, not a /find summary
+        _put(_collection_of, tid, (entry.get("belongs_to_collection") or {}).get("id") or 0)
     minutes = _entry_runtime(entry, kind)
     if minutes:
         _put(_runtime_cache, (kind, tid, None, None), minutes)
@@ -513,3 +515,56 @@ async def namesakes(token: str, tmdbid=None, imdbid=None, tvdbid=None
         logger.info("TMDB: tv %s %r shares its name with %s", tid, disp,
                     ", ".join(f"{oid} ({year or '?'}: {', '.join(names)})" for oid, year, names in result))
     return result
+
+
+# Other films of a movie's TMDB collection ("Wicked" -> "Wicked: For Good").
+_collection_of: dict[int, int] = {}
+_siblings: dict[int, list[str]] = {}
+
+
+async def sibling_titles(token: str, tmdbid=None, imdbid=None) -> list[str]:
+    """English, original and Czech titles of the other films in the movie's
+    TMDB collection, [] when it has none or on any error (fail open).
+
+    A Webshare/HellSpy sequel is named after the first film plus its own words
+    ("Wicked For Good (2025)" in a search for Wicked (2024)): the year is within
+    tolerance, and with the searched film's tmdbid echoed, Radarr grabbed it for
+    the first film. Knowing the sequels' titles lets the search drop it."""
+    if not token:
+        return []
+    imdb = _imdb_id(imdbid)
+    tid = _known_id("movie", tmdbid, imdb, None)
+    if tid and int(tid) in _siblings:
+        return _siblings[int(tid)]
+    titles: list[str] = []
+    try:
+        async with httpx.AsyncClient(timeout=10.0, headers=_headers(token)) as client:
+            if not tid:
+                tid = await _find_id(client, "movie", tmdbid, imdb, None)
+            if not tid:
+                return []
+            tid = int(tid)
+            cid = _collection_of.get(tid)
+            if cid is None:
+                r = await client.get(f"{_BASE}/movie/{tid}")
+                cid = ((r.json().get("belongs_to_collection") or {}).get("id") or 0) if r.status_code == 200 else None
+                if cid is None:
+                    return []
+                _put(_collection_of, tid, cid)
+            if cid:
+                for params in ({}, {"language": "cs-CZ"}):
+                    r = await client.get(f"{_BASE}/collection/{cid}", params=params)
+                    if r.status_code != 200:
+                        return []
+                    for part in r.json().get("parts") or []:
+                        if part.get("id") == tid:
+                            continue
+                        for key in ("title", "original_title"):
+                            name = str(part.get(key) or "").strip()
+                            if name and name not in titles:
+                                titles.append(name)
+    except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
+        logger.warning("TMDB collection of movie %s failed: %s", tmdbid or imdb, str(exc) or type(exc).__name__)
+        return []
+    _put(_siblings, tid, titles)
+    return titles

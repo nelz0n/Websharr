@@ -35,6 +35,7 @@ from .tmdb import lookup as tmdb_lookup
 from .tmdb import lookup_by_id as tmdb_lookup_by_id
 from .skyhook import series_title as skyhook_title
 from .tmdb import namesakes as tmdb_namesakes
+from .tmdb import sibling_titles as tmdb_sibling_titles
 from .tmdb import runtime as tmdb_runtime
 from .tmdb import show_titles as tmdb_show_titles
 from .webshare import SearchResult, WebshareError
@@ -750,6 +751,24 @@ def movie_title_prefix(display: str, year: int, titles, name: str) -> str:
     return f"{display} {year} - "
 
 
+def sequel_reason(titles, name: str, siblings) -> str:
+    """The other film of the same collection a movie file is ("" when none):
+    the words after the searched title are exactly what another part adds to
+    it — "Wicked For Good (2025)" in a search for Wicked (2024), "Pribeh hracek 2"
+    for Toy Story. Only collection parts that extend the searched title count,
+    so "Star Wars IV" for Star Wars (1977) is not mistaken for a sequel."""
+    stem = name.rsplit(".", 1)[0] if _is_video(name) else name
+    ntoks = normalize_text(stem).split()
+    own = sorted({tuple(normalize_text(t).split()) for t in _as_titles(titles) if t}, key=len, reverse=True)
+    for sib in siblings or ():
+        stoks = tuple(normalize_text(sib).split())
+        for k in own:
+            if k and len(stoks) > len(k) and stoks[:len(k)] == k and tuple(ntoks[:len(stoks)]) == stoks \
+                    and stoks not in own:
+                return sib
+    return ""
+
+
 def _year_tokens(name: str) -> list[int]:
     return [int(t) for t in normalize_text(name).split()
             if t.isdigit() and len(t) == 4 and 1900 <= int(t) <= 2099]
@@ -1233,6 +1252,11 @@ async def _newznab(request: Request, source: Source):
     # both "DuckTales" and "Kačeří příběhy"): the release gets our first-air
     # year after the title, or Sonarr files it under the other show, and files
     # matched only under such a name must prove they're ours (namesake_reason).
+    # The other parts of a movie's collection: a sequel named "<title> <its words>"
+    # matches the searched title and its year is within tolerance (sequel_reason).
+    siblings: list[str] = []
+    if settings.tmdb_token and t == "movie" and (params.get("tmdbid") or params.get("imdbid")):
+        siblings = await tmdb_sibling_titles(settings.tmdb_token, params.get("tmdbid"), params.get("imdbid"))
     namesakes = ()
     if settings.tmdb_token and t == "tvsearch" and by_id:
         namesakes = await tmdb_namesakes(settings.tmdb_token, params.get("tmdbid"),
@@ -1291,6 +1315,11 @@ async def _newznab(request: Request, source: Source):
                 continue  # drop Webshare's loose non-matching fulltext hits
             if year_conflict(r.name, year):
                 continue  # same-named other title (DuckTales 1987 vs 2017)
+            if siblings:
+                sequel = sequel_reason(titles, r.name, siblings)
+                if sequel:
+                    logger.info("Dropped %r: it is %r, another film of the collection", r.name, sequel)
+                    continue
             if want_ep is not None or want_season is not None:
                 fs, fe = file_marker(titles, r.name)
                 if want_ep is not None and fe != want_ep:

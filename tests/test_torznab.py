@@ -1518,3 +1518,43 @@ def test_skyhook_title_cached_and_fails_open(monkeypatch):
     assert len(calls) == 1
     assert asyncio.run(skyhook.series_title("1")) == ""  # failure: TMDB title stays
     assert asyncio.run(skyhook.series_title("abc")) == "" and len(calls) == 2
+
+
+def test_sequel_reason():
+    from app.torznab import sequel_reason
+    sibs = ["Wicked: For Good", "Wicked: Část 2"]
+    assert sequel_reason(["Wicked"], "Wicked For Good (2025) CZ Dabing 4K HDR 2160p.mkv", sibs) == "Wicked: For Good"
+    assert sequel_reason(["Wicked"], "Wicked (2024) CZ Dabing 2160p.mkv", sibs) == ""
+    toy = ["Toy Story 2", "Příběh hraček 2", "Toy Story 3"]
+    assert sequel_reason(["Toy Story", "Příběh hraček"], "Pribeh hracek 2 (1999) CZ.mkv", toy) == "Příběh hraček 2"
+    assert sequel_reason(["Toy Story", "Příběh hraček"], "Toy Story 1995 1080p CZ.mkv", toy) == ""
+    # a part that doesn't extend the searched title is not a sequel marker for it
+    assert sequel_reason(["Star Wars"], "Star Wars IV 1977 CZ.mkv", ["The Empire Strikes Back"]) == ""
+
+
+def test_movie_search_drops_a_sequel_of_the_collection(client, fake_webshare, monkeypatch):
+    """Wicked (2024) searched by id: "Wicked For Good (2025)" (year within
+    tolerance) was grabbed for it through the echoed tmdbid."""
+    from app import torznab
+    from app.settings import settings
+    monkeypatch.setattr(settings, "aliases", [])
+    monkeypatch.setattr(settings, "tmdb_token", "tok")
+
+    async def by_id(token, kind, tmdbid=None, imdbid=None, tvdbid=None):
+        return ("Wicked", "", "en", (), 2024)
+
+    async def by_name(token, kind, q):
+        return None
+
+    async def siblings(token, tmdbid=None, imdbid=None):
+        return ["Wicked: For Good"]
+
+    monkeypatch.setattr(torznab, "tmdb_lookup_by_id", by_id)
+    monkeypatch.setattr(torznab, "tmdb_lookup", by_name)
+    monkeypatch.setattr(torznab, "tmdb_sibling_titles", siblings)
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [SearchResult("seq", "Wicked For Good (2025) CZ Dabing 4K HDR 2160p.mkv", 6_000_000_000),
+                             SearchResult("own", "Wicked (2024) CZ Dabing 1080p.mkv", 5_000_000_000)]
+    resp = client.get("/torznab/api", params={"t": "movie", "apikey": "testkey", "tmdbid": "402431"})
+    guids = [i.findtext("guid") for i in ET.fromstring(resp.content).findall("channel/item")]
+    assert guids == ["websharr-own"]
