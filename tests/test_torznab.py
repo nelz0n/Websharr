@@ -1530,6 +1530,12 @@ def test_sequel_reason():
     assert sequel_reason(["Toy Story", "Příběh hraček"], "Toy Story 1995 1080p CZ.mkv", toy) == ""
     # a part that doesn't extend the searched title is not a sequel marker for it
     assert sequel_reason(["Star Wars"], "Star Wars IV 1977 CZ.mkv", ["The Empire Strikes Back"]) == ""
+    # a part number after the title with another year: a sequel the collection names differently
+    assert sequel_reason(["Wicked", "Čarodějka"], "Carodejka 2 (2025)cz 2160p.mkv", [], 2024)
+    assert sequel_reason(["Wicked"], "Wicked.Parte.2.2025.iTA-ENG.Bluray.2160p.mkv", [], 2024)
+    assert not sequel_reason(["Star Wars"], "Star Wars IV 1977 CZ.mkv", [], 1977)  # own year
+    assert not sequel_reason(["Wicked"], "Wicked 2024 2160p DDP 5.1 CZ.mkv", [], 2024)  # audio, own year
+    assert not sequel_reason(["Toy Story"], "Toy Story 2 CZ.mkv", [], 1995)  # no year: undecided, stays
 
 
 def test_movie_search_drops_a_sequel_of_the_collection(client, fake_webshare, monkeypatch):

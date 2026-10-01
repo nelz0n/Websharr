@@ -751,7 +751,11 @@ def movie_title_prefix(display: str, year: int, titles, name: str) -> str:
     return f"{display} {year} - "
 
 
-def sequel_reason(titles, name: str, siblings) -> str:
+_PART_LEAD = frozenset({"part", "parte", "partie", "teil", "cast", "dil", "chapter", "kapitola", "vol", "volume"})
+_SEQUEL_NUM_RE = re.compile(r"^(?:[2-9]|ii|iii|iv|v|vi|vii|viii|ix)$")
+
+
+def sequel_reason(titles, name: str, siblings, year: int = 0) -> str:
     """The other film of the same collection a movie file is ("" when none):
     the words after the searched title are exactly what another part adds to
     it — "Wicked For Good (2025)" in a search for Wicked (2024), "Pribeh hracek 2"
@@ -766,6 +770,17 @@ def sequel_reason(titles, name: str, siblings) -> str:
             if k and len(stoks) > len(k) and stoks[:len(k)] == k and tuple(ntoks[:len(stoks)]) == stoks \
                     and stoks not in own:
                 return sib
+    # A part number right after the title ("Carodejka 2 (2025)", "Wicked Parte 2
+    # 2025") with a year that isn't ours: a sequel the collection names
+    # differently. With our own year it stays ("Star Wars IV 1977").
+    rest = next((ntoks[len(k):] for k in own if k and tuple(ntoks[:len(k)]) == k), None)
+    if rest and year:
+        if rest[0] in _PART_LEAD:
+            rest = rest[1:]
+        audio = len(rest) > 1 and rest[0] in ("2", "5", "7") and rest[1] in ("0", "1")  # "5.1"
+        years = _year_tokens(name)
+        if rest and _SEQUEL_NUM_RE.match(rest[0]) and not audio and years and year not in years:
+            return f"part {rest[0]} ({years[0]})"
     return ""
 
 
@@ -1315,8 +1330,8 @@ async def _newznab(request: Request, source: Source):
                 continue  # drop Webshare's loose non-matching fulltext hits
             if year_conflict(r.name, year):
                 continue  # same-named other title (DuckTales 1987 vs 2017)
-            if siblings:
-                sequel = sequel_reason(titles, r.name, siblings)
+            if t == "movie":
+                sequel = sequel_reason(titles, r.name, siblings, year)
                 if sequel:
                     logger.info("Dropped %r: it is %r, another film of the collection", r.name, sequel)
                     continue
