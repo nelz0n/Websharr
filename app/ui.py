@@ -182,6 +182,7 @@ async def ui_settings_get(request: Request):
         "aliases": settings.aliases,
         "tmdb_token_set": bool(settings.tmdb_token),
         "runtime_check": settings.runtime_check,
+        "duplicate_fallback": settings.duplicate_fallback,
         "max_concurrent": request.app.state.downloads.max_concurrent,
         "notify_urls": settings.notify_urls,
         "notify_vip_days": settings.notify_vip_days,
@@ -259,6 +260,11 @@ async def ui_settings_post(request: Request):
         if not isinstance(body.get("runtime_check"), bool):
             return JSONResponse({"error": "runtime_check must be true or false"}, status_code=400)
         settings.runtime_check = body["runtime_check"]
+
+    if "duplicate_fallback" in body:
+        if not isinstance(body.get("duplicate_fallback"), bool):
+            return JSONResponse({"error": "duplicate_fallback must be true or false"}, status_code=400)
+        settings.duplicate_fallback = body["duplicate_fallback"]
 
     if "max_concurrent" in body:
         try:

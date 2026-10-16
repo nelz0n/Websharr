@@ -626,6 +626,114 @@ def relevance(queries: list[str], name: str) -> float:
     return best
 
 
+# Duplicate fallback (opt-in, settings.duplicate_fallback). Webshare hosts the
+# same file many times under different idents, and a grabbed file's link is
+# often dead ("File temporarily unavailable") while a copy is fine. Nothing is
+# merged or hidden: every file stays its own release with its own guid and
+# publish date, so the feed is the same list with the setting on or off. A
+# release only names, in its link, other files *of the same feed* that are the
+# same content, for the download client to fetch instead (see downloads.py).
+#
+# "Same content" is a heuristic, kept narrow on purpose: the same byte size
+# (from 50 MB) and extension, the same episode marker or title + year read from
+# each name itself (independent of how the search was asked), and the same
+# measured length. Equal bytes and length don't prove equal tracks; that is
+# acceptable only because a copy replaces the whole file before any byte of it
+# is on disk, after being re-checked, and only when the grabbed file is gone.
+_DUP_MIN_SIZE = 50 * 1024 * 1024
+_DUP_MAX_COPIES = 5
+_DUP_LENGTH_TOLERANCE = 1  # s; Webshare reports one file's length the same way
+# Time the length probes of possible copies may take; whatever isn't measured
+# by then gets no copies (fail closed), the feed itself is unaffected.
+_DUP_BUDGET = 10.0
+
+_EP_ID_RE = re.compile(
+    r"(?<![a-z0-9])(?:s(\d{1,2})e(\d{1,3})((?:-?e\d{1,3}|-\d{1,3})*)|(\d{1,2})x(\d{1,3}))(?![a-z0-9])")
+
+
+def episode_identity(name: str) -> tuple[tuple[int, int], ...]:
+    """Every (season, episode) the file name itself marks with SxxEyy (also
+    multi-episode S01E01E02 / S01E01-03) or 1x05, sorted; () when none. A bare
+    "05" is no marker: what it means depends on the query."""
+    marks: set[tuple[int, int]] = set()
+    for m in _EP_ID_RE.finditer((name or "").lower()):
+        if m.group(1):
+            season = int(m.group(1))
+            eps = [int(m.group(2)), *(int(e) for e in re.findall(r"\d+", m.group(3)))]
+        else:
+            season, eps = int(m.group(4)), [int(m.group(5))]
+        marks.update((season, e) for e in eps)
+    return tuple(sorted(marks))
+
+
+def movie_identity(name: str) -> tuple[str, int] | None:
+    """(title, year) from a movie file name: the words before the first year
+    token, a leading article dropped. None without a year or a title."""
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    toks = normalize_text(stem).split()
+    for i, tok in enumerate(toks):
+        if i and len(tok) == 4 and tok.isdigit() and 1900 <= int(tok) <= 2099:
+            title = toks[1:i] if toks[0] in _ARTICLES else toks[:i]
+            return (" ".join(title), int(tok)) if title else None
+    return None
+
+
+def content_identity(name: str, kind: str) -> tuple | None:
+    """What a file name says it contains, or None when it doesn't say enough
+    to call another file the same. TV ("tv"): its episode markers. Movies: its
+    title and year, and no episode marker."""
+    episodes = episode_identity(name)
+    if kind != "movie":
+        return ("tv", episodes) if episodes else None
+    movie = None if episodes else movie_identity(name)
+    return ("movie", movie) if movie else None
+
+
+def _dup_groups(results: list[SearchResult], kind: str) -> list[list[SearchResult]]:
+    """Results sharing size, extension and content identity, in feed order;
+    only groups of two or more."""
+    groups: dict[tuple, list[SearchResult]] = {}
+    for r in results:
+        identity = content_identity(r.name, kind)
+        if r.size < _DUP_MIN_SIZE or identity is None:
+            continue
+        ext = r.name.rsplit(".", 1)[-1].lower() if "." in r.name else ""
+        groups.setdefault((r.size, ext, identity), []).append(r)
+    return [g for g in groups.values() if len(g) > 1]
+
+
+def find_copies(groups: list[list[SearchResult]], lengths: dict[str, int]
+                ) -> dict[str, list[str]]:
+    """For each file, up to five others of its group with the same measured
+    length, in feed order. A file of unknown length has no copies and is no
+    copy."""
+    copies: dict[str, list[str]] = {}
+    for group in groups:
+        for r in group:
+            n = lengths.get(r.ident, 0)
+            if not n:
+                continue
+            same = [o.ident for o in group if o is not r and lengths.get(o.ident, 0)
+                    and abs(lengths[o.ident] - n) <= _DUP_LENGTH_TOLERANCE]
+            if same:
+                copies[r.ident] = same[:_DUP_MAX_COPIES]
+    return copies
+
+
+async def _copies_of(client, shown: list[SearchResult], kind: str
+                     ) -> tuple[dict[str, list[str]], dict[str, int]]:
+    """(copies, lengths) for the files about to be listed. Only files listed
+    are candidates, so a copy has passed every filter its file passed (name,
+    episode, password, video, runtime check). Lengths come from file_info
+    (cached when the runtime check measured them already)."""
+    groups = _dup_groups(shown, kind)
+    if not groups:
+        return {}, {}
+    _h, _a, lengths, _unfinished = await _probe(
+        client, [r for g in groups for r in g], all_files=True, timeout=_DUP_BUDGET)
+    return find_copies(groups, lengths), lengths
+
+
 # Window the synthetic publish dates fall into (see _pub_date).
 _PUB_EPOCH = 1640995200  # 2022-01-01 UTC
 _PUB_SPAN = 365 * 86400
@@ -649,8 +757,12 @@ def _render_feed(request: Request, results: list[SearchResult], category: str,
                  *, query: str | None = None, season: str | None = None,
                  ep: str | None = None, episodes: dict[str, int] | None = None,
                  heights: dict[str, int] | None = None, audio: dict[str, str] | None = None,
-                 language: str = "", czech_titles: list[str] | None = None) -> Response:
+                 language: str = "", czech_titles: list[str] | None = None,
+                 copies: dict[str, list[str]] | None = None,
+                 lengths: dict[str, int] | None = None) -> Response:
     heights = heights or {}
+    copies = copies or {}
+    lengths = lengths or {}
     audio = audio or {}
     episodes = episodes or {}
     ET.register_namespace("torznab", TORZNAB_NS)
@@ -691,6 +803,12 @@ def _render_feed(request: Request, results: list[SearchResult], category: str,
             f"&name={urllib.parse.quote(_asciify(r.name))}&size={r.size}"
             f"&nzbname={urllib.parse.quote(title)}"
         )
+        # Duplicate fallback: the same content under other idents, and the
+        # length they were matched on (re-checked before one is downloaded).
+        # Only the link carries them; guid and pubDate stay this file's own.
+        if copies.get(r.ident):
+            link += (f"&alt={urllib.parse.quote(','.join(copies[r.ident]))}"
+                     f"&altlen={lengths[r.ident]}")
         ET.SubElement(item, "link").text = link
         ET.SubElement(item, "pubDate").text = _pub_date(r.ident)
         ET.SubElement(item, "size").text = str(r.size)
@@ -867,9 +985,18 @@ async def torznab_api(request: Request):
         else:
             shown = merged[:limit]  # runtime unknown: label probes only, as with the check off
             heights, audio, _lengths, _unfinished = await _probe(client, shown)
+    # Opt-in: name the listed files' verified copies for the download client.
+    # Off, the feed is exactly what it was without the feature.
+    copies: dict[str, list[str]] = {}
+    lengths: dict[str, int] = {}
+    if settings.duplicate_fallback:
+        copies, lengths = await _copies_of(client, shown, _tmdb_kind(t, params.get("cat")))
+        if copies:
+            logger.info("%d listed files have identical copies to fall back to", len(copies))
     return _render_feed(request, shown, category, heights=heights, audio=audio,
                         query=display, season=(season if t == "tvsearch" else None), ep=ep,
-                        episodes=episodes, language=language, czech_titles=czech_titles)
+                        episodes=episodes, language=language, czech_titles=czech_titles,
+                        copies=copies, lengths=lengths)
 
 
 @router.get("/torznab/nzb/{ident}")
@@ -885,7 +1012,17 @@ async def torznab_nzb(ident: str, request: Request):
     except ValueError:
         size = 0
 
-    content = build_nzb(ident, name, size)
+    # Copies ride along only while the duplicate fallback is on.
+    alternates: list[str] = []
+    length = 0
+    if settings.duplicate_fallback:
+        alternates = [a for a in request.query_params.get("alt", "").split(",") if a]
+        try:
+            length = int(request.query_params.get("altlen", "0"))
+        except ValueError:
+            length = 0
+
+    content = build_nzb(ident, name, size, alternates, length)
     # Name the NZB after the parseable release title (nzbname) when present:
     # Sonarr re-uploads it to the SABnzbd client using this filename as the job
     # name, so the download folder carries SxxEyy for import.

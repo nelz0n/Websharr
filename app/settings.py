@@ -63,6 +63,10 @@ class Settings:
         # duration is far off the TMDB runtime. Off unless enabled (env var
         # RUNTIME_CHECK is the initial default, the UI toggle overrides it).
         self.runtime_check: bool = config.runtime_check
+        # Duplicate fallback: a grab carries up to five verified copies of the
+        # same file, downloaded instead when the grabbed file's link is dead.
+        # Off unless enabled (env var DUPLICATE_FALLBACK, then the UI toggle).
+        self.duplicate_fallback: bool = config.duplicate_fallback
         # Concurrent-download limit; env var is the initial default, editable in
         # the UI (Settings and the Queue page).
         self.max_concurrent: int = config.max_concurrent
@@ -100,6 +104,8 @@ class Settings:
         # A saved False must win over the env default, so no `or` fallback here.
         check = data.get("runtime_check")
         self.runtime_check = check if isinstance(check, bool) else config.runtime_check
+        fallback = data.get("duplicate_fallback")
+        self.duplicate_fallback = fallback if isinstance(fallback, bool) else config.duplicate_fallback
         try:
             self.max_concurrent = max(1, int(data.get("max_concurrent") or config.max_concurrent))
         except (TypeError, ValueError):
@@ -128,6 +134,7 @@ class Settings:
             "aliases": self.aliases,
             "tmdb_token": self.tmdb_token,
             "runtime_check": self.runtime_check,
+            "duplicate_fallback": self.duplicate_fallback,
             "max_concurrent": self.max_concurrent,
             "notify_urls": self.notify_urls,
             "notify_vip_days": self.notify_vip_days,

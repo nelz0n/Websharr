@@ -166,6 +166,34 @@ def test_runtime_check_env_default(monkeypatch, tmp_path):
     assert fresh.runtime_check is True
 
 
+def test_duplicate_fallback_setting_defaults_off_validates_and_persists(client, monkeypatch):
+    import json
+
+    from app.config import Config, config
+    from app.settings import settings
+
+    _setup(client)
+    assert client.get("/ui/api/settings").json()["duplicate_fallback"] is False
+    assert 'id="set-duplicate-fallback"' in client.get("/ui").text
+
+    assert client.post("/ui/api/settings", json={"duplicate_fallback": True}).status_code == 200
+    assert client.get("/ui/api/settings").json()["duplicate_fallback"] is True
+    assert json.loads(config.settings_file.read_text())["duplicate_fallback"] is True
+    assert client.post("/ui/api/settings", json={"duplicate_fallback": 1}).status_code == 400
+    assert settings.duplicate_fallback is True
+
+    # A saved "off" wins over an env default of "on" after a restart.
+    client.post("/ui/api/settings", json={"duplicate_fallback": False})
+    monkeypatch.setattr(config, "duplicate_fallback", True)
+    settings.load()
+    assert settings.duplicate_fallback is False
+
+    monkeypatch.delenv("DUPLICATE_FALLBACK", raising=False)
+    assert Config().duplicate_fallback is False
+    monkeypatch.setenv("DUPLICATE_FALLBACK", "true")
+    assert Config().duplicate_fallback is True
+
+
 def test_webshare_password_never_stored_in_plaintext(client):
     from app.config import config
     import json

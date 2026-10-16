@@ -19,6 +19,9 @@ class Config:
         # Drop files whose duration is far off the TMDB runtime (opt-in, off by
         # default); the UI value in settings.json overrides this.
         self.runtime_check = os.environ.get("RUNTIME_CHECK", "").strip().lower() in ("1", "true", "yes", "on")
+        # Fall back to an identical copy of a grabbed file whose link is dead
+        # (opt-in, off by default); the UI value in settings.json overrides this.
+        self.duplicate_fallback = os.environ.get("DUPLICATE_FALLBACK", "").strip().lower() in ("1", "true", "yes", "on")
         # Apprise notification URLs (comma/newline separated) and the VIP-expiry
         # warning threshold in days; UI values override these.
         self.notify_urls = [u.strip() for u in re.split(r"[,\n]", os.environ.get("NOTIFY_URLS", "")) if u.strip()]

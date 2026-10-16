@@ -827,6 +827,10 @@
         <p class="shint">How many files download from Webshare at the same time. Extra
           grabs wait in the queue. You can also change this right on the
           <b>Queue</b> page.</p>
+        <p class="shint">Optionally, a grab can carry <b>identical copies</b> of the
+          file (same size, extension, episode or title and year, and length) that
+          Websharr downloads instead when the grabbed file's link is dead. Off by
+          default; a copy is only used before any byte is on disk.</p>
       </div>
       <div class="sform">
         <label>Max concurrent downloads
@@ -836,6 +840,9 @@
           <button class="primary" id="set-maxdl-save">Save</button>
         </div>
         <span class="sresult" id="set-maxdl-result"></span>
+        <label class="scheck"><input id="set-duplicate-fallback" type="checkbox">
+          Fall back to an identical copy when a link is dead</label>
+        <span class="sresult" id="set-fallback-result"></span>
       </div>
     </div>
 
@@ -1157,6 +1164,7 @@ const App = {
       $("set-tmdb-token").placeholder = s.tmdb_token_set
         ? "•••••••• (set — leave empty to keep)" : "TMDB Read Access Token";
       $("set-runtime-check").checked = !!s.runtime_check;
+      $("set-duplicate-fallback").checked = !!s.duplicate_fallback;
       this.renderAliases(s.aliases || []);
     } catch (e) { /* offline banner already covers this */ }
   },
@@ -1788,6 +1796,17 @@ $("set-runtime-check").onchange = async (e) => {
   } catch (err) {
     e.target.checked = !on;
     sresult("set-runtime-result", false, err.message);
+  }
+};
+
+$("set-duplicate-fallback").onchange = async (e) => {
+  const on = e.target.checked;
+  try {
+    await uiPost("settings", { duplicate_fallback: on });
+    sresult("set-fallback-result", true, on ? "✓ Copy fallback on" : "✓ Copy fallback off");
+  } catch (err) {
+    e.target.checked = !on;
+    sresult("set-fallback-result", false, err.message);
   }
 };
 
