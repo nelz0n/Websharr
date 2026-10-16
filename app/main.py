@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI):
     app.state.account_ts = 0.0
     app.state.account_refresh_ok = None  # None until the first refresh attempt ends
     # Set by the UI when Webshare credentials change: refresh now instead of
-    # leaving /health "pending" (or failed) until the next hourly round.
+    # leaving /ready "pending" (or failed) until the next hourly round.
     app.state.account_refresh = asyncio.Event()
     monitor_task = asyncio.create_task(_account_monitor(app))
     logger.info("Websharr %s started (user=%s)", __version__,
@@ -157,8 +157,8 @@ def _storage_check() -> dict:
 
 
 def _webshare_check() -> dict:
-    """Judge the account from what _account_monitor cached — a health probe
-    must never hit Webshare itself (Docker polls it every minute)."""
+    """Judge the account from what _account_monitor cached — a readiness probe
+    must never hit Webshare itself (monitors poll it every minute)."""
     if not config.webshare_username:
         return {"status": "error", "reason": "Webshare account not configured"}
     ts = app.state.account_ts
@@ -176,12 +176,21 @@ def _webshare_check() -> dict:
 
 @app.get("/health")
 async def health():
-    """Unauthenticated liveness for Docker/Uptime Kuma: 503 when downloads
-    can't work. Exposes no paths or account details."""
+    """Liveness for the Docker HEALTHCHECK: the process answers. Account and
+    storage trouble is reported by /ready, not here."""
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+async def ready():
+    """Unauthenticated readiness for Uptime Kuma and the like: 200 only when
+    downloads can work, 503 with a short reason per check otherwise (also while
+    the account isn't verified yet). Exposes no paths or account details."""
     checks = {"storage": _storage_check(), "webshare": _webshare_check()}
-    ok = all(c["status"] != "error" for c in checks.values())
-    return JSONResponse({"status": "ok" if ok else "error", "checks": checks},
-                        status_code=200 if ok else 503)
+    states = {c["status"] for c in checks.values()}
+    overall = "ok" if states == {"ok"} else ("error" if "error" in states else "pending")
+    return JSONResponse({"status": overall, "checks": checks},
+                        status_code=200 if overall == "ok" else 503)
 
 
 def _fmt_speed(bps: float) -> str:

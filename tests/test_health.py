@@ -22,8 +22,8 @@ def healthy(no_account, client, monkeypatch):
     return client
 
 
-def test_health_ok(healthy):
-    resp = healthy.get("/health")
+def test_ready_ok(healthy):
+    resp = healthy.get("/ready")
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
@@ -34,67 +34,80 @@ def test_health_ok(healthy):
     assert str(config.complete_dir) not in resp.text
 
 
-def test_health_pending_at_startup(no_account, client, monkeypatch):
+def test_ready_pending_at_startup(no_account, client, monkeypatch):
+    # Not verified yet is not ready; /health is unaffected.
     monkeypatch.setattr(config, "webshare_username", "ws@example.com")
-    resp = client.get("/health")
-    assert resp.status_code == 200
+    resp = client.get("/ready")
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "pending"
     assert resp.json()["checks"]["webshare"]["status"] == "pending"
+    assert client.get("/health").status_code == 200
 
 
-def test_health_first_refresh_failed(no_account, client, monkeypatch):
+def test_ready_first_refresh_failed(no_account, client, monkeypatch):
     monkeypatch.setattr(config, "webshare_username", "ws@example.com")
     app.state.account_refresh_ok = False
-    resp = client.get("/health")
+    resp = client.get("/ready")
     assert resp.status_code == 503
     assert resp.json()["checks"]["webshare"]["status"] == "error"
 
 
-def test_health_not_configured(no_account, client):
-    resp = client.get("/health")
+def test_ready_not_configured(no_account, client):
+    resp = client.get("/ready")
     assert resp.status_code == 503
     assert "not configured" in resp.json()["checks"]["webshare"]["reason"]
 
 
-def test_health_stale_account(healthy):
+def test_health_is_plain_liveness(no_account, client, monkeypatch, tmp_path):
+    """/health stays the unconditional liveness the Docker HEALTHCHECK polls:
+    same body as before, 200 even when /ready fails."""
+    monkeypatch.setattr(config, "complete_dir", tmp_path / "gone")
+    assert client.get("/ready").status_code == 503
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+
+def test_ready_stale_account(healthy):
     app.state.account_ts = time.time() - 4 * ACCOUNT_REFRESH
     app.state.account_refresh_ok = False
-    resp = healthy.get("/health")
+    resp = healthy.get("/ready")
     assert resp.status_code == 503
     assert resp.json()["status"] == "error"
     assert "not refreshed" in resp.json()["checks"]["webshare"]["reason"]
 
 
-def test_health_tolerates_one_failed_refresh(healthy):
+def test_ready_tolerates_one_failed_refresh(healthy):
     app.state.account_ts = time.time() - ACCOUNT_REFRESH
     app.state.account_refresh_ok = False
-    assert healthy.get("/health").status_code == 200
+    assert healthy.get("/ready").status_code == 200
 
 
-def test_health_vip_expired(healthy):
+def test_ready_vip_expired(healthy):
     app.state.account = {"vip": False, "vip_days": 0}
-    resp = healthy.get("/health")
+    resp = healthy.get("/ready")
     assert resp.status_code == 503
     assert "VIP" in resp.json()["checks"]["webshare"]["reason"]
 
 
-def test_health_dir_not_writable(healthy, monkeypatch):
+def test_ready_dir_not_writable(healthy, monkeypatch):
     # os.access instead of chmod: tests may run as root, which ignores modes.
     monkeypatch.setattr(app_main.os, "access", lambda path, mode: False)
-    resp = healthy.get("/health")
+    resp = healthy.get("/ready")
     assert resp.status_code == 503
     assert "not writable" in resp.json()["checks"]["storage"]["reason"]
 
 
-def test_health_dir_missing(healthy, monkeypatch, tmp_path):
+def test_ready_dir_missing(healthy, monkeypatch, tmp_path):
     monkeypatch.setattr(config, "complete_dir", tmp_path / "gone")
-    resp = healthy.get("/health")
+    resp = healthy.get("/ready")
     assert resp.status_code == 503
     assert resp.json()["checks"]["storage"]["reason"] == "complete dir missing"
     assert str(tmp_path) not in resp.text
 
 
 def test_monitor_refreshes_right_away_when_woken(monkeypatch):
-    """Saving new Webshare credentials wakes the monitor: /health doesn't stay
+    """Saving new Webshare credentials wakes the monitor: /ready doesn't stay
     pending (or failed) until the next hourly refresh."""
     import asyncio
     from types import SimpleNamespace
