@@ -28,6 +28,7 @@ from .nzb import build_nzb
 from .settings import settings
 from .tmdb import lookup as tmdb_lookup
 from .tmdb import lookup_by_id as tmdb_lookup_by_id
+from .tmdb import movie_rivals as tmdb_movie_rivals
 from .tmdb import runtime as tmdb_runtime
 from .webshare import SearchResult, WebshareError
 
@@ -645,12 +646,242 @@ def _pub_date(ident: str) -> str:
     return email.utils.formatdate(_PUB_EPOCH + offset)
 
 
+# --- opt-in: the TMDB title in front of a movie name Radarr can't parse -----
+# A Czech-only movie name ("Pribeh hracek 1080p CZ") doesn't parse to the movie
+# in Radarr; mapped only by the echoed id, the grab is blocked from automatic
+# import ("matched to movie by ID, Manual Import required"). That block is a
+# safety net, so with settings.movie_title_prefix on "<TMDB title> <year> - "
+# goes in front only when nothing leaves the film in doubt — the contract is
+# movie_prefix_refusal. Off (the default), release names are left as they are.
+
+# Language markers may sit between the title and the tags, but never hide what
+# follows them: "Rocky CZ 2" still has a "2" after the title.
+_PREFIX_LANG_TAGS = frozenset("""
+cz sk cze ces czech cesky ceske ceska slovak slovensky slovenske slovenska svk slo
+en eng english ger german fre french ita spa pol hun rus jpn
+dabing dab dabovano dabovany dabovane titulky tit sub subs multi multisub dual
+""".split())
+# Technical tags (resolution, source, codec, audio); the first one ends the part
+# of the name that says which film it is.
+_PREFIX_TECH_TAGS = frozenset("""
+480p 540p 576p 720p 1080p 1080i 2160p 4320p 480 540 576 720 1080 2160 4320 4k 8k uhd fhd hd sd
+bluray bdrip brrip bdremux remux bd web webdl webrip webdlrip hdtv hdtvrip tvrip dvdrip dvd dvd5
+dvd9 hdrip satrip dvbrip pdtv vhsrip amzn nf dsnp hmax atvp
+x264 x265 h264 h265 hevc avc xvid divx av1 vp9 10bit 8bit hdr hdr10 dv dovi sdr
+aac ac3 eac3 dts dtshd dd ddp dd5 ddp5 truehd atmos flac mp3 lpcm opus
+""".split())
+_PREFIX_TECH_PAIRS = frozenset({("h", "264"), ("h", "265"), ("x", "264"), ("x", "265"), ("blu", "ray"),
+                                ("tv", "rip"), ("dolby", "vision"), ("dolby", "atmos")})
+_ROMAN = {r: n for n, r in enumerate(
+    "i ii iii iv v vi vii viii ix x xi xii xiii xiv xv xvi xvii xviii xix xx".split(), 1)}
+# Anywhere in a name: a part of the film, a split file, or not the film at all.
+_PREFIX_PART_RE = re.compile(
+    r"^(?:part|pt|parte|partie|teil|dil|cast|vol|volume|chapter|kapitola|cd|disc|disk)\d*$")
+_PREFIX_JUNK = frozenset({"sample", "trailer", "teaser", "extras", "bonus", "featurette"})
+_AUDIO_CHANNELS = ({"1", "2", "5", "6", "7"}, {"0", "1"})  # "5 1", "2 0", "dd5 1"
+# A file's length must be this close to the TMDB runtime. Tighter than the
+# runtime check's bounds: here it is a required signal (still never proof).
+_PREFIX_RUNTIME = (0.85, 1.25)
+# Time the prefix decision may take per search (TMDB lookups, probes); a file
+# not confirmed by then gets no prefix (fail closed).
+_PREFIX_BUDGET = 15.0
+
+
+def _numeral(tok: str) -> int:
+    """The value of an arabic (1-99) or Roman (I-XX) number token, else 0."""
+    if tok.isdigit() and len(tok) <= 2:
+        return int(tok)
+    return _ROMAN.get(tok, 0)
+
+
+def _is_year(tok: str) -> bool:
+    return tok.isdigit() and len(tok) == 4 and 1900 <= int(tok) <= 2099
+
+
+def _starts_with_title(toks: list[str], title: list[str]) -> bool:
+    """`toks` begin with the `title` tokens; a title's closing number may be
+    written either way ("Rocky II" = "Rocky 2")."""
+    if not title or len(toks) < len(title) or toks[:len(title) - 1] != title[:-1]:
+        return False
+    head, last = toks[len(title) - 1], title[-1]
+    return head == last or (len(title) > 1 and _numeral(last) > 0 and _numeral(head) == _numeral(last))
+
+
+def _is_tag(toks: list[str], i: int) -> bool:
+    """A technical tag starts at token `i` ("1080p", "H.264")."""
+    return toks[i] in _PREFIX_TECH_TAGS or tuple(toks[i:i + 2]) in _PREFIX_TECH_PAIRS
+
+
+def movie_name_identity(name: str, display: str, aliases, year: int) -> tuple[str, bool, str]:
+    """(title, dated, refusal): whether a file name names exactly the searched
+    movie, as far as the name alone can tell.
+
+    The name (extension stripped, normalized) must begin with the TMDB title or
+    one of its TMDB original/Czech titles (`title`: the one it begins with), and
+    then hold nothing but the year, language markers and, from the first
+    technical tag on, release details: no subtitle word ("Rocky Returns"), no
+    number or Roman numeral ("Rocky 2", "Rocky V", "Rocky CZ 2"), no part, CD or
+    sample marker anywhere. Every year in it must be the TMDB year — exactly:
+    a year off is how a remake or a namesake differs. When the TMDB title ends
+    in a number ("Rocky II"), only titles carrying that number count. `dated`
+    says whether the name has the year; `refusal` is "" when it passes.
+    """
+    dtoks = normalize_text(display).split()
+    if not dtoks or not year:
+        return "", False, "no TMDB title or year"
+    titles = [dtoks] + [normalize_text(a).split() for a in aliases or () if a]
+    if len(dtoks) > 1 and _numeral(dtoks[-1]):
+        titles = [t for t in titles if any(_numeral(x) == _numeral(dtoks[-1]) for x in t)]
+    stem = name.rsplit(".", 1)[0] if _is_video(name) else name
+    toks = normalize_text(stem).split()
+    title = next((t for t in sorted(titles, key=len, reverse=True) if _starts_with_title(toks, t)), None)
+    if title is None:
+        return "", False, "doesn't start with the movie's title"
+    matched = " ".join(title)
+    rest = toks[len(title):]
+    dated = False
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if _is_year(tok):
+            if int(tok) != year:
+                return matched, False, f"year {tok}, not {year}"
+            dated = True
+        elif tok in _PREFIX_LANG_TAGS:
+            pass
+        elif _is_tag(rest, i):
+            break
+        elif _numeral(tok):
+            return matched, False, f"number {tok!r} after the title"
+        else:
+            return matched, False, f"{tok!r} after the title"
+        i += 1
+    tail = rest[i:]
+    for j, tok in enumerate(tail):
+        prev, nxt = (tail[j - 1] if j else ""), (tail[j + 1] if j + 1 < len(tail) else "")
+        if _is_year(tok):
+            if int(tok) != year:
+                return matched, False, f"year {tok}, not {year}"
+            dated = True
+        elif _PREFIX_PART_RE.match(tok) or tok in _PREFIX_JUNK:
+            return matched, False, f"{tok!r} in the name"
+        elif tok.isdigit() and len(tok) <= 2:
+            channels = (tok in _AUDIO_CHANNELS[0] and nxt in _AUDIO_CHANNELS[1]) or \
+                (tok in _AUDIO_CHANNELS[1] and prev[-1:] in _AUDIO_CHANNELS[0])
+            if not (channels or nxt == "bit"):
+                return matched, False, f"number {tok!r} in the name"
+        elif tok in _ROMAN and tok not in ("i", "v", "x"):  # those three are also tags/words
+            return matched, False, f"numeral {tok!r} in the name"
+    return matched, dated, ""
+
+
+def movie_prefix_refusal(name: str, display: str, aliases, year: int, *,
+                         length_s: int, minutes: int, rivals) -> str:
+    """Why `name` must not get "<display> <year> - " in front; "" when it may.
+
+    The matching-confidence contract — the prefix needs ALL of:
+    1. the name names exactly the movie (movie_name_identity);
+    2. the file's length is known and within _PREFIX_RUNTIME of the TMDB
+       runtime. A required signal only: a matching length never proves the
+       film ("Rocky Balboa" runs as long as "Rocky"), an unknown one refuses;
+    3. TMDB said which other films the name could be (`rivals` from
+       tmdb.movie_rivals; None = the lookup failed, refuse): another film of
+       the same title, or a collection part whose title extends it ("Rocky" ->
+       "Rocky II"), makes a name without the year ambiguous, and one of the
+       same year makes even a dated name ambiguous. A name that also carries
+       the words such a part adds ("Rocky 1976 1080p Balboa") is refused.
+    """
+    title, dated, why = movie_name_identity(name, display, aliases, year)
+    if why:
+        return why
+    if not length_s or not minutes:
+        return "length or TMDB runtime unknown"
+    lo, hi = _PREFIX_RUNTIME
+    if not lo <= length_s / 60 / minutes <= hi:
+        return f"{length_s // 60} min, TMDB says {minutes} min"
+    if rivals is None:
+        return "TMDB couldn't say which other films share the name"
+    ttoks = title.split()
+    toks = set(normalize_text(name).split())
+    for other, other_year, part in rivals:
+        otoks = normalize_text(other).split()
+        extra = otoks[len(ttoks):]
+        if not _starts_with_title(otoks, ttoks) or (extra and not part):
+            continue
+        if extra and set(extra) <= toks:
+            return f"the name also has the words of {other!r}"
+        if other_year == year:
+            return f"{other!r} ({other_year}) has the same name and year"
+        if not dated:
+            return f"without the year it could be {other!r} ({other_year or '?'})"
+    return ""
+
+
+def _canonical(name: str, display: str, year: int) -> bool:
+    """The name already begins with "<display> <year>": nothing to add."""
+    toks, dtoks = normalize_text(name).split(), normalize_text(display).split()
+    return toks[:len(dtoks) + 1] == dtoks + [str(year)]
+
+
+async def _movie_prefixes(client, shown: list[SearchResult], tmdbid, imdbid) -> dict[str, str]:
+    """ident -> "<TMDB title> <year> -" for the shown files that get it under
+    movie_prefix_refusal's contract. TMDB answers come from the caches of the
+    same search where possible; a file not confirmed within _PREFIX_BUDGET
+    gets nothing."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _PREFIX_BUDGET
+
+    def left() -> float:
+        return max(0.0, deadline - loop.time())
+
+    token = settings.tmdb_token
+    try:
+        found = await asyncio.wait_for(tmdb_lookup_by_id(token, "movie", tmdbid, imdbid), timeout=left())
+        if not found or not found[0] or not found[4]:
+            return {}
+        display, orig, _lang, czech, year = found
+        aliases = (orig, *czech)
+        named: dict[str, tuple[SearchResult, str]] = {}
+        for r in shown:
+            title, _dated, why = movie_name_identity(r.name, display, aliases, year)
+            if why:
+                logger.debug("No title prefix for %r: %s", r.name, why)
+            elif not _canonical(r.name, display, year):
+                named[r.ident] = (r, title)
+        if not named:
+            return {}
+        minutes, exact = await asyncio.wait_for(
+            tmdb_runtime(token, "movie", tmdbid, imdbid), timeout=left())
+        # the TMDB spelling of each title a file begins with, to look up namesakes
+        spelled = {" ".join(normalize_text(t).split()): t for t in (*aliases, display) if t}
+        rivals = await asyncio.wait_for(tmdb_movie_rivals(
+            token, sorted({spelled.get(t, t) for _r, t in named.values()}), tmdbid, imdbid), timeout=left())
+    except asyncio.TimeoutError:
+        logger.info("Title prefix: TMDB didn't answer within %ds, no prefix", _PREFIX_BUDGET)
+        return {}
+    _h, _a, lengths, _u = await _probe(client, [r for r, _t in named.values()], all_files=True,
+                                       timeout=left())
+    prefix = _asciify(f"{display} {year} -")
+    out: dict[str, str] = {}
+    for ident, (r, _title) in named.items():
+        why = movie_prefix_refusal(r.name, display, aliases, year, length_s=lengths.get(ident, 0),
+                                   minutes=minutes if exact else 0, rivals=rivals)
+        if why:
+            logger.info("No title prefix for %r: %s", r.name, why)
+            continue
+        logger.info("Title prefix %r for %r", prefix, r.name)
+        out[ident] = prefix
+    return out
+
+
 def _render_feed(request: Request, results: list[SearchResult], category: str,
                  *, query: str | None = None, season: str | None = None,
                  ep: str | None = None, episodes: dict[str, int] | None = None,
                  heights: dict[str, int] | None = None, audio: dict[str, str] | None = None,
-                 language: str = "", czech_titles: list[str] | None = None) -> Response:
+                 language: str = "", czech_titles: list[str] | None = None,
+                 prefixes: dict[str, str] | None = None) -> Response:
     heights = heights or {}
+    prefixes = prefixes or {}
     audio = audio or {}
     episodes = episodes or {}
     ET.register_namespace("torznab", TORZNAB_NS)
@@ -667,6 +898,10 @@ def _render_feed(request: Request, results: list[SearchResult], category: str,
         title = release_title(query, season, episodes.get(r.ident, ep), r.name) \
             if query is not None else \
             (r.name.rsplit(".", 1)[0] if "." in r.name else r.name)
+        # Opt-in canonical movie title ("Toy Story 1995 - Pribeh hracek ..."),
+        # see _movie_prefixes; never set with the setting off.
+        if prefixes.get(r.ident):
+            title = f"{prefixes[r.ident]} {title}"
         # Label quality from the real video height when the name lacks one,
         # so *arr doesn't reject the release as "Unknown" quality.
         if not _RES_RE.search(title) and heights.get(r.ident):
@@ -867,9 +1102,17 @@ async def torznab_api(request: Request):
         else:
             shown = merged[:limit]  # runtime unknown: label probes only, as with the check off
             heights, audio, _lengths, _unfinished = await _probe(client, shown)
+    # Opt-in: the TMDB title and year in front of movie names that leave no
+    # doubt which film they are, so Radarr can import them by itself. Off,
+    # nothing here runs and release names are unchanged.
+    prefixes: dict[str, str] = {}
+    if settings.movie_title_prefix and settings.tmdb_token and t == "movie" and shown \
+            and (params.get("tmdbid") or params.get("imdbid")):
+        prefixes = await _movie_prefixes(client, shown, params.get("tmdbid"), params.get("imdbid"))
     return _render_feed(request, shown, category, heights=heights, audio=audio,
                         query=display, season=(season if t == "tvsearch" else None), ep=ep,
-                        episodes=episodes, language=language, czech_titles=czech_titles)
+                        episodes=episodes, language=language, czech_titles=czech_titles,
+                        prefixes=prefixes)
 
 
 @router.get("/torznab/nzb/{ident}")

@@ -1,3 +1,4 @@
+import re
 import xml.etree.ElementTree as ET
 
 from app.torznab import (
@@ -1002,3 +1003,299 @@ def test_runtime_check_off_without_known_runtime(client, fake_webshare, monkeypa
     fake_webshare.results = [SearchResult("spec", "Toy Story 1995 1080p CZ.mkv", 1_000_000_000)]
     fake_webshare.file_infos = {"spec": {"length": 60, "width": 1920, "height": 1080}}
     assert _feed(client, t="movie", tmdbid="862", cat="2000") == ["spec"]
+
+
+# --- opt-in movie title prefix ---------------------------------------------
+
+_ROCKY = ("Rocky", "", "en", (), 1976)
+_TOY_STORY_CZ = ("Toy Story", "", "en", ("Příběh hraček",), 1995)
+# Rocky's collection and a namesake, as tmdb.movie_rivals reports them
+_ROCKY_RIVALS = [("Rocky II", 1979, True), ("Rocky V", 1990, True), ("Rocky Balboa", 2006, True),
+                 ("Rocky", 1981, False)]
+
+
+def test_movie_name_identity_needs_nothing_between_title_and_tags():
+    """The reviewer's cases: a Roman numeral, a subtitle word, a number behind a
+    language marker — and plain sequel markers — never pass for the film."""
+    from app.torznab import movie_name_identity
+    for name in ("Rocky V 1080p.mkv", "Rocky Returns 1080p.mkv", "Rocky CZ 2 1080p.mkv",
+                 "Rocky 2 1080p.mkv", "Rocky II 1080p.mkv", "Rocky Balboa 1080p CZ.mkv",
+                 "Rocky CZ Balboa 1080p.mkv", "Rocky (1976) II 1080p.mkv", "Rocky Part 2 1080p.mkv",
+                 "Rocky-GRP.mkv", "Rocky Extended 1080p.mkv"):
+        title, _dated, why = movie_name_identity(name, "Rocky", (), 1976)
+        assert why, name
+    # after the first technical tag, numbers, numerals and part/CD markers still refuse
+    for name in ("Rocky 1080p 2.mkv", "Rocky 1080p CZ II.mkv", "Rocky 1976 1080p CD2.avi",
+                 "Rocky 1976 720p sample.mkv", "Rocky 1976 1080p dil 2.mkv"):
+        assert movie_name_identity(name, "Rocky", (), 1976)[2], name
+    # any year must be the TMDB year, exactly
+    assert movie_name_identity("Rocky 1977 1080p.mkv", "Rocky", (), 1976)[2] == "year 1977, not 1976"
+    assert movie_name_identity("Rocky 1080p 1975 CZ.mkv", "Rocky", (), 1976)[2]
+    # the film's own name, its year, language markers and release details pass
+    assert movie_name_identity("Rocky (1976).mkv", "Rocky", (), 1976) == ("rocky", True, "")
+    assert movie_name_identity("Rocky 1976 1080p CZ.mkv", "Rocky", (), 1976) == ("rocky", True, "")
+    assert movie_name_identity("Rocky CZ (1976) 1080p.mkv", "Rocky", (), 1976) == ("rocky", True, "")
+    assert movie_name_identity("Rocky.1976.1080p.BluRay.x264.DTS-HD.MA.5.1-GRP.mkv", "Rocky", (), 1976) == \
+        ("rocky", True, "")
+    assert movie_name_identity("Rocky 1080p CZ.mkv", "Rocky", (), 1976) == ("rocky", False, "")
+    assert movie_name_identity("Pribeh hracek 1080p CZ.mkv", "Toy Story", ("Příběh hraček",), 1995) == \
+        ("pribeh hracek", False, "")
+    # no TMDB year, no identity
+    assert movie_name_identity("Coco 1080p.mkv", "Coco", (), 0)[2]
+
+
+def test_movie_name_identity_for_a_numbered_title():
+    """A sequel's own number must be in the name, in either spelling; a title
+    of the film that lacks it ("Rocky") doesn't count for "Rocky II"."""
+    from app.torznab import movie_name_identity
+    assert movie_name_identity("Rocky II (1979) CZ.mkv", "Rocky II", (), 1979) == ("rocky ii", True, "")
+    assert movie_name_identity("Rocky 2 (1979) CZ.mkv", "Rocky II", (), 1979) == ("rocky ii", True, "")
+    assert movie_name_identity("Rocky (1979) CZ.mkv", "Rocky II", ("Rocky",), 1979)[2]
+    assert movie_name_identity("Rocky III 1080p.mkv", "Rocky II", (), 1979)[2]
+    assert movie_name_identity("Rocky II 2 1080p.mkv", "Rocky II", (), 1979)[2]
+    assert movie_name_identity("Pribeh hracek 2 CZ.mkv", "Toy Story 2", ("Příběh hraček 2",), 1999) == \
+        ("pribeh hracek 2", False, "")
+
+
+def test_movie_prefix_refusal_contract():
+    from app.torznab import movie_prefix_refusal
+
+    def why(name, length=119 * 60, minutes=119, rivals=_ROCKY_RIVALS):
+        return movie_prefix_refusal(name, "Rocky", (), 1976, length_s=length, minutes=minutes, rivals=rivals)
+
+    # the name proves nothing more than it says
+    assert why("Rocky V 1080p.mkv") and why("Rocky Returns 1080p.mkv") and why("Rocky CZ 2 1080p.mkv")
+    # runtime: unknown on either side refuses; a match is required, never enough
+    assert why("Rocky (1976).mkv", length=0) == "length or TMDB runtime unknown"
+    assert why("Rocky (1976).mkv", minutes=0) == "length or TMDB runtime unknown"
+    assert why("Rocky (1976).mkv", length=60 * 60)
+    assert why("Rocky Balboa 1080p.mkv")                  # same length, another film
+    # the rival lookup failed: no identity claim
+    assert why("Rocky (1976).mkv", rivals=None)
+    # Rocky has sequels and a 1981 namesake: without the year it could be either
+    assert why("Rocky 1080p CZ.mkv").startswith("without the year it could be")
+    assert why("Rocky (1976).mkv") == ""
+    assert why("Rocky 1976 1080p CZ.mkv") == ""
+    assert why("Rocky CZ (1976) 1080p.mkv") == ""
+    # a namesake of the same year leaves even the year undecided
+    assert why("Rocky (1976).mkv", rivals=[("Rocky", 1976, False)])
+    # a search hit that only extends the title isn't a namesake ("Rocky Horror")
+    assert why("Rocky 1080p CZ.mkv", rivals=[("Rocky Horror Picture Show", 1975, False)]) == ""
+    # ...but a collection part that extends it is, and its words anywhere refuse
+    assert why("Rocky 1080p CZ.mkv", rivals=[("Rocky II", 1979, True)])
+    assert why("Rocky 1976 1080p Balboa CZ.mkv") == "the name also has the words of 'Rocky Balboa'"
+
+
+def _enable_title_prefix(monkeypatch, result, minutes, rivals=(), calls=None):
+    """Turn the title prefix on and fake TMDB: the id lookup answers `result`,
+    the runtime `minutes`, movie_rivals `rivals` (None = failed), recording each
+    rivals call in `calls`."""
+    from app import torznab
+    from app.settings import settings
+    monkeypatch.setattr(settings, "aliases", [])
+    monkeypatch.setattr(settings, "tmdb_token", "tok")
+    monkeypatch.setattr(settings, "movie_title_prefix", True)
+
+    async def by_id(token, kind, tmdbid=None, imdbid=None, tvdbid=None):
+        return result
+
+    async def by_name(token, kind, q):
+        return result
+
+    async def runtime(token, kind, tmdbid=None, imdbid=None, tvdbid=None, season=None, ep=None):
+        return minutes, bool(minutes)
+
+    async def movie_rivals(token, titles, tmdbid=None, imdbid=None):
+        if calls is not None:
+            calls.append(list(titles))
+        return None if rivals is None else list(rivals)
+
+    monkeypatch.setattr(torznab, "tmdb_lookup_by_id", by_id)
+    monkeypatch.setattr(torznab, "tmdb_lookup", by_name)
+    monkeypatch.setattr(torznab, "tmdb_runtime", runtime)
+    monkeypatch.setattr(torznab, "tmdb_movie_rivals", movie_rivals)
+
+
+def _titles(client, **params):
+    """guid -> (title, nzbname from the link) of every feed item."""
+    from urllib.parse import parse_qs, urlsplit
+    resp = client.get("/torznab/api", params={"apikey": "testkey", **params})
+    return {i.findtext("guid").removeprefix("websharr-"):
+            (i.findtext("title"), parse_qs(urlsplit(i.findtext("link")).query)["nzbname"][0])
+            for i in ET.fromstring(resp.content).findall("channel/item")}
+
+
+def _rocky_files(fake_webshare, length=119 * 60):
+    names = {"v": "Rocky V 1080p.mkv", "returns": "Rocky Returns 1080p.mkv",
+             "cz2": "Rocky CZ 2 1080p.mkv", "two": "Rocky 2 1080p.mkv", "ii": "Rocky II 1080p.mkv",
+             "balboa": "Rocky Balboa 1080p CZ.mkv", "bare": "Rocky 1080p CZ.mkv",
+             "czyear": "Rocky CZ (1976) 1080p.mkv", "canon": "Rocky (1976) 1080p.mkv",
+             "off1": "Rocky 1977 CZ 1080p.mkv"}
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [SearchResult(k, n, 4_000_000_000 - i) for i, (k, n) in enumerate(names.items())]
+    fake_webshare.file_infos = {k: {**_INFO, "length": length} for k in names}
+    return names
+
+
+def test_movie_title_prefix_is_off_by_default(client, fake_webshare, monkeypatch):
+    """Off (the default), release names are exactly the file names, nothing asks
+    TMDB for rivals or runtime, and only the usual label probes run."""
+    from app import torznab
+    from app.settings import settings
+    assert settings.movie_title_prefix is False
+    calls = []
+    _enable_title_prefix(monkeypatch, _TOY_STORY_CZ, 81, rivals=[], calls=calls)
+    monkeypatch.setattr(settings, "movie_title_prefix", False)
+    runtimes = []
+
+    async def runtime(*args, **kwargs):
+        runtimes.append(args)
+        return 81, True
+
+    monkeypatch.setattr(torznab, "tmdb_runtime", runtime)
+    probed = []
+    real = fake_webshare.file_info
+
+    async def file_info(ident):
+        probed.append(ident)
+        return await real(ident)
+
+    fake_webshare.file_info = file_info
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [SearchResult("cz", "Pribeh hracek 1080p CZ.mkv", 2_000_000_000)]
+    fake_webshare.file_infos = {"cz": {**_INFO, "length": 81 * 60}}
+    assert _titles(client, t="movie", tmdbid="862", cat="2000") == \
+        {"cz": ("Pribeh hracek 1080p CZ", "Pribeh hracek 1080p CZ")}
+    assert calls == [] and runtimes == [] and probed == []
+
+
+def test_movie_feed_prefixes_an_unambiguous_czech_name(client, fake_webshare, monkeypatch):
+    calls = []
+    _enable_title_prefix(monkeypatch, _TOY_STORY_CZ, 81, calls=calls)
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [SearchResult("cz", "Příběh hraček 1080p CZ.mkv", 2_000_000_000),
+                             SearchResult("en", "Toy Story 1995 720p.mkv", 1_000_000_000)]
+    fake_webshare.file_infos = {"cz": {**_INFO, "length": 81 * 60}, "en": {**_INFO, "length": 81 * 60}}
+    feed = _titles(client, t="movie", tmdbid="862", cat="2000")
+    assert feed["cz"] == ("Toy Story 1995 - Pribeh hracek 1080p CZ",) * 2
+    assert feed["en"] == ("Toy Story 1995 720p",) * 2      # already "<title> <year>": left alone
+    assert calls == [["Příběh hraček"]]                     # only the title a file began with
+
+
+def test_movie_feed_prefix_rocky_cases(client, fake_webshare, monkeypatch):
+    """Every file runs exactly as long as Rocky: only the name that leaves no
+    doubt (title, then its year among markers and tags) gets the prefix."""
+    _enable_title_prefix(monkeypatch, _ROCKY, 119, rivals=_ROCKY_RIVALS)
+    names = _rocky_files(fake_webshare)
+    feed = _titles(client, t="movie", tmdbid="1366", cat="2000")
+    assert feed["czyear"][0] == "Rocky 1976 - Rocky CZ (1976) 1080p"
+    for key, name in names.items():
+        if key != "czyear":
+            assert feed[key][0] == name.rsplit(".", 1)[0], key   # unchanged
+            assert feed[key][1] == feed[key][0]
+
+
+def test_movie_feed_no_prefix_without_runtime_or_probe(client, fake_webshare, monkeypatch):
+    """The reviewer's offline feed: no TMDB runtime and no probe result -> no
+    prefix and no canonical nzbname, however clean the name."""
+    _enable_title_prefix(monkeypatch, _TOY_STORY_CZ, 0, rivals=[])
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [SearchResult("cz", "Pribeh hracek 1080p CZ.mkv", 2_000_000_000)]
+    fake_webshare.file_infos = {"cz": {**_INFO, "length": 0}}
+    assert _titles(client, t="movie", tmdbid="862", cat="2000")["cz"] == ("Pribeh hracek 1080p CZ",) * 2
+    # a known runtime doesn't help while the file's own length is unknown
+    _enable_title_prefix(monkeypatch, _TOY_STORY_CZ, 81, rivals=[])
+    assert _titles(client, t="movie", tmdbid="862", cat="2000")["cz"] == ("Pribeh hracek 1080p CZ",) * 2
+
+
+def test_movie_feed_no_prefix_when_the_rival_lookup_fails(client, fake_webshare, monkeypatch):
+    """TMDB can't say which other films share the name (error or timeout): no
+    prefix, even for a dated name, and the search isn't held up."""
+    import asyncio
+    import time
+    from app import torznab
+    _enable_title_prefix(monkeypatch, _ROCKY, 119, rivals=None)
+    _rocky_files(fake_webshare)
+    assert _titles(client, t="movie", tmdbid="1366", cat="2000")["czyear"][0] == "Rocky CZ (1976) 1080p"
+
+    async def hung(*args, **kwargs):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(torznab, "tmdb_movie_rivals", hung)
+    monkeypatch.setattr(torznab, "_PREFIX_BUDGET", 0.3)
+    started = time.monotonic()
+    assert _titles(client, t="movie", tmdbid="1366", cat="2000")["czyear"][0] == "Rocky CZ (1976) 1080p"
+    assert time.monotonic() - started < 5
+
+
+def test_movie_feed_prefix_needs_an_id_search(client, fake_webshare, monkeypatch):
+    """A text search (no tmdbid/imdbid) or a TV search never gets the prefix."""
+    _enable_title_prefix(monkeypatch, _TOY_STORY_CZ, 81, rivals=[])
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [SearchResult("cz", "Pribeh hracek 1080p CZ.mkv", 2_000_000_000)]
+    fake_webshare.file_infos = {"cz": {**_INFO, "length": 81 * 60}}
+    assert _titles(client, t="movie", q="Toy Story", cat="2000")["cz"][0] == "Pribeh hracek 1080p CZ"
+    assert _titles(client, t="search", q="Toy Story", cat="2000")["cz"][0] == "Pribeh hracek 1080p CZ"
+
+
+def test_movie_feed_prefix_with_the_runtime_check(client, fake_webshare, monkeypatch):
+    """With #4's runtime check on too: a file far off the runtime is dropped
+    before the prefix is considered; a file of the right length but outside the
+    prefix's tighter bounds stays, unprefixed."""
+    from app.settings import settings
+    _enable_title_prefix(monkeypatch, _TOY_STORY_CZ, 81, rivals=[])
+    monkeypatch.setattr(settings, "runtime_check", True)
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [SearchResult("ok", "Pribeh hracek 1080p CZ.mkv", 3_000_000_000),
+                             SearchResult("long", "Pribeh hracek 720p CZ.mkv", 2_000_000_000),
+                             SearchResult("clip", "Pribeh hracek 480p CZ.mkv", 1_000_000_000)]
+    fake_webshare.file_infos = {"ok": {**_INFO, "length": 80 * 60}, "long": {**_INFO, "length": 120 * 60},
+                                "clip": {**_INFO, "length": 5 * 60}}
+    feed = _titles(client, t="movie", tmdbid="862", cat="2000")
+    assert sorted(feed) == ["long", "ok"]
+    assert feed["ok"][0] == "Toy Story 1995 - Pribeh hracek 1080p CZ"
+    assert feed["long"][0] == "Pribeh hracek 720p CZ"
+
+
+# Radarr-like parse of a movie release title: a regex modeled on the "normal
+# movie format" pattern of Radarr's Parser (title, then the year, then a
+# separator). An isolated contract check only: no live Radarr was run.
+_RADARR_LIKE = re.compile(
+    r"^(?P<title>(?![(\[]).+?)?(?:(?:[-_\W](?<![)\[!]))*"
+    r"(?P<year>(1(8|9)|20)\d{2}(?!p|i|x|\d+|\]|\W\d+)))+(\W+|_|$)(?!\\)", re.I)
+
+
+def test_prefixed_titles_meet_the_radarr_import_contract(client, fake_webshare, monkeypatch):
+    """Every prefixed release title (and the nzbname the job folder gets) starts
+    with "<TMDB title> <year> - " and parses back, Radarr-like, to exactly that
+    title and year — the mapping Radarr needs to import it by itself."""
+    from app.torznab import _asciify, normalize_text
+    cases = [
+        (_TOY_STORY_CZ, 81, "Příběh hraček (1995) 1080p CZ.mkv"),
+        (_TOY_STORY_CZ, 81, "Příběh.hraček.1080p.CZ.mkv"),
+        (("Spider-Man: No Way Home", "", "en", ("Spider-Man: Bez domova",), 2021), 148,
+         "Spider-Man Bez domova 2160p CZ.mkv"),
+        (("Rocky II", "", "en", (), 1979), 119, "Rocky II CZ 1080p.mkv"),
+        (("Amélie", "Le Fabuleux Destin d'Amélie Poulain", "fr", ("Amélie z Montmartru",), 2001), 122,
+         "Amélie z Montmartru 1080p CZ dabing.mkv"),
+    ]
+    for i, (result, minutes, name) in enumerate(cases):
+        _enable_title_prefix(monkeypatch, result, minutes, rivals=[])
+        fake_webshare.fuzzy = True
+        fake_webshare.results = [SearchResult(f"f{i}", name, 2_000_000_000)]
+        fake_webshare.file_infos = {f"f{i}": {**_INFO, "length": minutes * 60}}
+        title, nzbname = _titles(client, t="movie", tmdbid="1", cat="2000")[f"f{i}"]
+        display, year = result[0], result[4]
+        assert title == nzbname, name
+        assert title.startswith(f"{_asciify(display)} {year} - "), title
+        m = _RADARR_LIKE.match(title)
+        assert m, title
+        assert normalize_text(m.group("title")).split() == normalize_text(display).split(), title
+        assert int(m.group("year")) == year, title
+        title.encode("ascii")  # Prowlarr header-safe
+    # a refused name keeps no canonical claim: nothing to map it by title
+    _enable_title_prefix(monkeypatch, _ROCKY, 119, rivals=_ROCKY_RIVALS)
+    fake_webshare.results = [SearchResult("r", "Rocky CZ 2 1080p.mkv", 2_000_000_000)]
+    fake_webshare.file_infos = {"r": {**_INFO, "length": 119 * 60}}
+    title, _nzb = _titles(client, t="movie", tmdbid="1366", cat="2000")["r"]
+    assert not _RADARR_LIKE.match(title)

@@ -19,6 +19,10 @@ class Config:
         # Drop files whose duration is far off the TMDB runtime (opt-in, off by
         # default); the UI value in settings.json overrides this.
         self.runtime_check = os.environ.get("RUNTIME_CHECK", "").strip().lower() in ("1", "true", "yes", "on")
+        # Put the TMDB title and year in front of movie names Radarr can't parse
+        # (opt-in, off by default); the UI value in settings.json overrides this.
+        self.movie_title_prefix = os.environ.get("MOVIE_TITLE_PREFIX", "").strip().lower() in (
+            "1", "true", "yes", "on")
         # Apprise notification URLs (comma/newline separated) and the VIP-expiry
         # warning threshold in days; UI values override these.
         self.notify_urls = [u.strip() for u in re.split(r"[,\n]", os.environ.get("NOTIFY_URLS", "")) if u.strip()]

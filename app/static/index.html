@@ -873,6 +873,12 @@
           special or excerpt, an hour-long file for a 7-minute episode). Off by
           default; named editions, multi-episode files and files of unknown length
           are never dropped for it.</p>
+        <p class="shint">Also optional: a movie file named only in Czech can get the
+          <b>TMDB title and year in front</b> so Radarr imports it by itself instead
+          of asking for a manual import. Off by default; only names that leave no
+          doubt which film they are (no other words or numbers after the title, a
+          known length close to the TMDB runtime, no namesake without the year)
+          get it.</p>
       </div>
       <div class="sform">
         <label>TMDB Read Access Token
@@ -886,6 +892,9 @@
         <label class="scheck"><input id="set-runtime-check" type="checkbox">
           Drop files far off the TMDB runtime</label>
         <span class="sresult" id="set-runtime-result"></span>
+        <label class="scheck"><input id="set-movie-prefix" type="checkbox">
+          Put the TMDB title in front of unambiguous movie names</label>
+        <span class="sresult" id="set-movie-prefix-result"></span>
       </div>
     </div>
 
@@ -1157,6 +1166,7 @@ const App = {
       $("set-tmdb-token").placeholder = s.tmdb_token_set
         ? "•••••••• (set — leave empty to keep)" : "TMDB Read Access Token";
       $("set-runtime-check").checked = !!s.runtime_check;
+      $("set-movie-prefix").checked = !!s.movie_title_prefix;
       this.renderAliases(s.aliases || []);
     } catch (e) { /* offline banner already covers this */ }
   },
@@ -1788,6 +1798,17 @@ $("set-runtime-check").onchange = async (e) => {
   } catch (err) {
     e.target.checked = !on;
     sresult("set-runtime-result", false, err.message);
+  }
+};
+
+$("set-movie-prefix").onchange = async (e) => {
+  const on = e.target.checked;
+  try {
+    await uiPost("settings", { movie_title_prefix: on });
+    sresult("set-movie-prefix-result", true, on ? "✓ Movie title prefix on" : "✓ Movie title prefix off");
+  } catch (err) {
+    e.target.checked = !on;
+    sresult("set-movie-prefix-result", false, err.message);
   }
 };
 

@@ -166,6 +166,48 @@ def test_runtime_check_env_default(monkeypatch, tmp_path):
     assert fresh.runtime_check is True
 
 
+def test_movie_title_prefix_setting_defaults_off_validates_and_persists(client, monkeypatch):
+    import json
+
+    from app.config import config
+    from app.settings import settings
+
+    _setup(client)
+    assert client.get("/ui/api/settings").json()["movie_title_prefix"] is False
+    assert 'id="set-movie-prefix"' in client.get("/ui").text
+
+    assert client.post("/ui/api/settings", json={"movie_title_prefix": True}).status_code == 200
+    assert client.get("/ui/api/settings").json()["movie_title_prefix"] is True
+    assert json.loads(config.settings_file.read_text())["movie_title_prefix"] is True
+    assert settings.runtime_check is False  # independent of the runtime check
+
+    rejected = client.post("/ui/api/settings", json={"movie_title_prefix": 1})
+    assert rejected.status_code == 400
+    assert settings.movie_title_prefix is True
+
+    # A saved "off" wins over an env default of "on" after a restart.
+    client.post("/ui/api/settings", json={"movie_title_prefix": False})
+    monkeypatch.setattr(config, "movie_title_prefix", True)
+    settings.load()
+    assert settings.movie_title_prefix is False
+
+
+def test_movie_title_prefix_env_default(monkeypatch, tmp_path):
+    from app.config import Config, config
+    from app.settings import Settings
+
+    monkeypatch.delenv("MOVIE_TITLE_PREFIX", raising=False)
+    assert Config().movie_title_prefix is False
+    monkeypatch.setenv("MOVIE_TITLE_PREFIX", "true")
+    assert Config().movie_title_prefix is True
+
+    monkeypatch.setattr(config, "settings_file", tmp_path / "settings.json")
+    monkeypatch.setattr(config, "movie_title_prefix", True)
+    fresh = Settings()
+    fresh.load()
+    assert fresh.movie_title_prefix is True
+
+
 def test_webshare_password_never_stored_in_plaintext(client):
     from app.config import config
     import json

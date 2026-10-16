@@ -106,11 +106,16 @@ def _fresh_probe_state(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _no_tmdb_runtime(monkeypatch):
-    """Tests never reach TMDB for runtimes: a test that turns the runtime check
-    on patches `tmdb_runtime` itself."""
+    """Tests never reach TMDB for runtimes or rival films: a test that turns the
+    runtime check or the title prefix on patches what it needs itself."""
     import app.torznab as torznab
 
     async def unknown(*args, **kwargs):
         return 0, False
 
     monkeypatch.setattr(torznab, "tmdb_runtime", unknown)
+
+    async def no_rivals(*args, **kwargs):
+        return None  # "TMDB couldn't tell": the title prefix fails closed
+
+    monkeypatch.setattr(torznab, "tmdb_movie_rivals", no_rivals)
