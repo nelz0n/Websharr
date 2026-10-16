@@ -94,9 +94,29 @@ def dub_language(name: str) -> str:
     return "Czech"
 
 
-# Audio-track language codes (Webshare file_info) that mean a CZ/SK release.
-_AUDIO_CZECH = {"CZE", "CES", "CS", "CZ"}
-_AUDIO_SLOVAK = {"SLO", "SLK", "SK"}
+# Audio-track language codes (Webshare file_info, ISO 639-2/1) -> *arr language names.
+_ISO_LANGS = {
+    "CZE": "Czech", "CES": "Czech", "CS": "Czech", "CZ": "Czech",
+    "SLO": "Slovak", "SLK": "Slovak", "SK": "Slovak",
+    "ENG": "English", "EN": "English", "GER": "German", "DEU": "German", "FRE": "French",
+    "FRA": "French", "SPA": "Spanish", "ITA": "Italian", "POL": "Polish", "HUN": "Hungarian",
+    "RUS": "Russian", "UKR": "Ukrainian", "JPN": "Japanese", "KOR": "Korean", "CHI": "Chinese",
+    "ZHO": "Chinese", "DAN": "Danish", "SWE": "Swedish", "NOR": "Norwegian", "FIN": "Finnish",
+    "DUT": "Dutch", "NLD": "Dutch", "POR": "Portuguese", "TUR": "Turkish",
+}
+
+
+def track_languages(codes) -> list[str]:
+    """*arr language names of the tagged audio tracks, CZ/SK first, no duplicates.
+
+    What the track metadata says, not a verified spoken language: tags are
+    sometimes missing or wrong (a dub muxed under the original's tag)."""
+    out: list[str] = []
+    for code in codes or ():
+        name = _ISO_LANGS.get((code or "").strip().upper())
+        if name and name not in out:
+            out.append(name)
+    return sorted(out, key=lambda n: n not in ("Czech", "Slovak"))
 
 
 def audio_language(codes) -> str:
@@ -105,12 +125,8 @@ def audio_language(codes) -> str:
     Only a positive signal: track tags are often missing or wrong, so their
     absence never overrides a marker in the file name.
     """
-    codes = {(c or "").strip().upper() for c in codes or ()}
-    if codes & _AUDIO_CZECH:
-        return "Czech"
-    if codes & _AUDIO_SLOVAK:
-        return "Slovak"
-    return ""
+    langs = track_languages(codes)
+    return "Czech" if "Czech" in langs else "Slovak" if "Slovak" in langs else ""
 
 
 def _xml_response(element: ET.Element, status_code: int = 200) -> Response:
@@ -324,14 +340,15 @@ async def _fetch_file_info(client, ident: str) -> dict:
 
 async def _probe(client, results: list[SearchResult], all_files: bool = False,
                  timeout: float | None = None
-                 ) -> tuple[dict[str, int], dict[str, str], dict[str, int], set[str]]:
+                 ) -> tuple[dict[str, int], dict[str, str], dict[str, dict], set[str]]:
     """Fetch file_info for results whose *name* leaves something open, and
-    return (heights, audio, lengths, unfinished): the video height for names
+    return (heights, audio, infos, unfinished): the video height for names
     without a resolution token — many CZ files ship without one and Sonarr/Radarr
     reject them as 'Unknown' quality otherwise — "Czech"/"Slovak" for names
     without a language marker whose audio track says so (a TV-rip dub named just
-    "... 1080p WEB-DL prima+"), and the duration in seconds of every probed file.
-    `all_files` probes every result (for the runtime check), not just those.
+    "... 1080p WEB-DL prima+"), and the file_info of every probed file.
+    `all_files` probes every result (for the runtime check and the measured
+    metadata), not just those.
     With a `timeout`, probes still running after it are no longer waited for
     and their idents returned in `unfinished` (fail open: those files go out
     unmeasured; the probes finish in the background and fill the cache)."""
@@ -347,21 +364,21 @@ async def _probe(client, results: list[SearchResult], all_files: bool = False,
 
     heights: dict[str, int] = {}
     audio: dict[str, str] = {}
-    lengths: dict[str, int] = {}
+    infos: dict[str, dict] = {}
     for task, r in tasks.items():
         if task in pending:
             continue
         # a probe that raised is unmeasured, like one that returned nothing
         info = {} if task.cancelled() or task.exception() is not None else task.result() or {}
-        if int(info.get("length") or 0) > 0:
-            lengths[r.ident] = int(info["length"])
+        if info:
+            infos[r.ident] = info
         height = resolution_class(int(info.get("width") or 0), int(info.get("height") or 0))
         if height and not _RES_RE.search(r.name):
             heights[r.ident] = height
         lang = audio_language(info.get("audio_languages"))
         if lang and not dub_language(r.name):
             audio[r.ident] = lang
-    return heights, audio, lengths, {tasks[t].ident for t in pending}
+    return heights, audio, infos, {tasks[t].ident for t in pending}
 
 
 # Runtime check (opt-in, settings.runtime_check). How far a file's duration may
@@ -400,21 +417,23 @@ def runtime_mismatch(length_s: int, minutes: int, kind: str, *,
     return ratio < lo or (hi is not None and ratio > hi)
 
 
-# Time a search may spend on the runtime check (TMDB runtime, probes and refill
-# pages) before it answers with what it has: Sonarr gives an indexer 100 s and
-# then ignores it for minutes. Whatever isn't measured by then goes out
-# unmeasured (fail open, as on a probe error).
+# Time a search may spend measuring files — the runtime check (TMDB runtime,
+# probes and refill pages) and the measured-metadata opt-ins share it — before
+# it answers with what it has: Sonarr gives an indexer 100 s and then ignores it
+# for minutes. Whatever isn't measured by then goes out unmeasured (fail open,
+# as on a probe error).
 _RUNTIME_BUDGET = 30.0
 # Extra Webshare result pages fetched per query to replace files the runtime
 # check dropped, at most.
 _RUNTIME_EXTRA_PAGES = 2
 
 
-async def _runtime_filtered(client, merged: list[SearchResult], limit: int, kind: str,
-                            minutes: int, exact: bool, more, deadline: float
-                            ) -> tuple[list[SearchResult], dict[str, int], dict[str, str]]:
-    """The first `limit` of `merged` whose duration doesn't contradict the TMDB
-    runtime, plus (heights, audio) of the probed ones.
+async def _measured(client, merged: list[SearchResult], limit: int, reject, more,
+                    deadline: float
+                    ) -> tuple[list[SearchResult], dict[str, int], dict[str, str], dict[str, dict]]:
+    """The first `limit` of `merged` that `reject(result, info)` doesn't drop (it
+    returns the reason, "" to keep), with every one of them measured, plus
+    (heights, audio, infos) of the probed ones.
 
     Files are measured in order, only as many as are needed to fill the limit;
     when dropped files leave it short, `more()` fetches the next Webshare page
@@ -426,42 +445,44 @@ async def _runtime_filtered(client, merged: list[SearchResult], limit: int, kind
     measured: set[str] = set()
     heights: dict[str, int] = {}
     audio: dict[str, str] = {}
+    infos: dict[str, dict] = {}
     while True:
         candidates = [r for r in merged if r.ident not in rejected][:limit]
         todo = [r for r in candidates if r.ident not in measured]
-        if not todo and len(candidates) >= limit:
-            break
+        if not todo and (len(candidates) >= limit or not rejected):
+            break  # full, or short without having dropped anything: nothing to replace
         left = deadline - loop.time()
         if left <= 0:
-            logger.info("Runtime check budget of %ds spent: remaining files go out unmeasured",
+            logger.info("Measuring budget of %ds spent: remaining files go out unmeasured",
                         _RUNTIME_BUDGET)
             break
         if not todo:
             try:
                 new = await asyncio.wait_for(more(), timeout=left)
             except asyncio.TimeoutError:
-                logger.info("Runtime check budget of %ds spent while refilling", _RUNTIME_BUDGET)
+                logger.info("Measuring budget of %ds spent while refilling", _RUNTIME_BUDGET)
                 break
             if not new:
                 break
             merged.extend(new)
             continue
-        h, a, lengths, unfinished = await _probe(client, todo, all_files=True, timeout=left)
+        h, a, i, unfinished = await _probe(client, todo, all_files=True, timeout=left)
         heights.update(h)
         audio.update(a)
+        infos.update(i)
         for r in todo:
             if r.ident in unfinished:
                 continue
             measured.add(r.ident)
-            if runtime_mismatch(lengths.get(r.ident, 0), minutes, kind, name=r.name, exact=exact):
-                logger.info("Dropped %r: %d min, expected ~%d min",
-                            r.name, lengths[r.ident] // 60, minutes)
+            reason = reject(r, i.get(r.ident, {}))
+            if reason:
+                logger.info("Dropped %r: %s", r.name, reason)
                 rejected.add(r.ident)
         if unfinished:
-            logger.info("Runtime check budget of %ds spent: %d files go out unmeasured",
+            logger.info("Measuring budget of %ds spent: %d files go out unmeasured",
                         _RUNTIME_BUDGET, len(unfinished))
             break
-    return [r for r in merged if r.ident not in rejected][:limit], heights, audio
+    return [r for r in merged if r.ident not in rejected][:limit], heights, audio, infos
 
 
 _EP_TOKEN = re.compile(r"^(s\d{1,2}e\d{1,3}|s\d{1,2}|\d{1,2}x\d{1,3}|\d{1,4})$")
@@ -650,6 +671,68 @@ def relevance(queries: list[str], name: str) -> float:
     return best
 
 
+# --- measured metadata (opt-in, settings.measured_metadata) -------------------
+# Webshare's file_info is a media probe: video codec and size, and per audio
+# track the codec, a channel count and a language tag, as reported. That is
+# all it knows: no channel layout (6 channels need not be 5.1), no codec
+# profile (DTS-HD MA and Atmos look like DTS / TrueHD), no HDR/DV, bit depth
+# or source. So only the reported codecs are added to a release title, and
+# only when the name names none: the uploader's own tags always win.
+
+# Codec tags already in a name: any of them means the name keeps its own.
+_VIDEO_TAG_RE = re.compile(
+    r"(?<![a-z0-9])(?:[xh][ ._-]?26[45]|hevc|avc|xvid|divx|av1|vp9|vc-?1|mpeg-?[24])(?![a-z0-9])", re.I)
+_AUDIO_TAG_RE = re.compile(
+    r"(?<![a-z0-9])(?:dd(?:p|\+)?(?:[ ._-]?[1-7][ ._]?[01])?|dolby(?:[ ._-]?digital)?|e-?ac-?3|ac-?3"
+    r"|dts(?:-?(?:hd|x|es|ma))*|truehd|atmos|aac(?:[ ._-]?[1-7][ ._]?[01])?|flac|mp[23]|opus|vorbis"
+    r"|l?pcm)(?![a-z0-9])", re.I)
+# Reported video codec -> title token. "H264"/"H265", never a bare "AVC"/"HEVC":
+# next to "BluRay" those read as a BR-DISK to Radarr and TRaSH's custom format.
+_VIDEO_TOKENS = {"H264": "H264", "AVC": "H264", "AVC1": "H264", "HEVC": "H265", "H265": "H265",
+                 "AV1": "AV1", "VP9": "VP9"}
+# Reported audio codec -> (title token, rank when picking one of several tracks).
+_AUDIO_TOKENS = {"TRUEHD": ("TrueHD", 6), "FLAC": ("FLAC", 5), "PCM": ("PCM", 5), "LPCM": ("PCM", 5),
+                 "EAC3": ("EAC3", 4), "DTS": ("DTS", 3), "AC3": ("AC3", 2), "OPUS": ("Opus", 1),
+                 "AAC": ("AAC", 1), "MP3": ("MP3", 0)}
+
+
+def _codec_key(fmt) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(fmt or "").upper())
+
+
+def video_codec(info: dict) -> str:
+    """Title token for the reported video codec, "" when unknown."""
+    return _VIDEO_TOKENS.get(_codec_key(info.get("format")), "")
+
+
+def audio_codec(info: dict, prefer: str = "") -> str:
+    """Title token for the reported codec of the best audio track, taken from
+    the tracks tagged `prefer` (e.g. the Czech dub) when there are any; "" when
+    nothing is known. The codec only: a channel count is not a layout, and a
+    DTS track is "DTS" whatever profile it may really have."""
+    tracks = info.get("audio") or []
+    pool = [t for t in tracks if prefer and _ISO_LANGS.get(t.get("language") or "") == prefer] or tracks
+    best, best_key = "", (-1, -1)
+    for t in pool:
+        key = _codec_key(t.get("format"))
+        token, rank = _AUDIO_TOKENS.get("DTS" if key.startswith("DTS") else key, ("", -1))
+        if token and (rank, int(t.get("channels") or 0)) > best_key:
+            best, best_key = token, (rank, int(t.get("channels") or 0))
+    return best
+
+
+def measured_tags(name: str, info: dict, prefer: str = "") -> list[str]:
+    """The reported video and audio codec tokens `name` doesn't carry yet: none
+    for a kind the name already tags in any form (DD5.1, DDP, AC3, DTS-HD,
+    TrueHD, Atmos, AAC2.0, x264, HEVC…), so nothing is doubled or contradicted."""
+    tokens = []
+    if not _VIDEO_TAG_RE.search(name) and video_codec(info):
+        tokens.append(video_codec(info))
+    if not _AUDIO_TAG_RE.search(name) and audio_codec(info, prefer):
+        tokens.append(audio_codec(info, prefer))
+    return tokens
+
+
 # Window the synthetic publish dates fall into (see _pub_date).
 _PUB_EPOCH = 1640995200  # 2022-01-01 UTC
 _PUB_SPAN = 365 * 86400
@@ -673,8 +756,12 @@ def _render_feed(request: Request, results: list[SearchResult], category: str,
                  *, query: str | None = None, season: str | None = None,
                  ep: str | None = None, episodes: dict[str, int] | None = None,
                  heights: dict[str, int] | None = None, audio: dict[str, str] | None = None,
-                 language: str = "", czech_titles: list[str] | None = None) -> Response:
+                 language: str = "", czech_titles: list[str] | None = None,
+                 infos: dict[str, dict] | None = None, metadata: bool = False) -> Response:
+    """`metadata` (the measured-metadata opt-in) adds what `infos` reports: the
+    codecs to the title, every tagged audio language to the language attrs."""
     heights = heights or {}
+    infos = infos if metadata and infos else {}
     audio = audio or {}
     episodes = episodes or {}
     ET.register_namespace("torznab", TORZNAB_NS)
@@ -704,6 +791,13 @@ def _render_feed(request: Request, results: list[SearchResult], category: str,
         marker, marker_re = ("SK", _SK_RE) if inferred == "Slovak" else ("CZ", _CZ_RE)
         if inferred and not marker_re.search(title):
             title = f"{title} {marker}"
+        info = infos.get(r.ident, {})
+        claimed = dub_language(r.name) or inferred
+        # The audio codec of the CZ/SK track when the release is a dub: that's
+        # the track a CZ profile cares about.
+        extra = measured_tags(title, info, claimed) if info else []
+        if extra:
+            title = f"{title} {' '.join(extra)}"
         ET.SubElement(item, "title").text = title
         ET.SubElement(item, "guid", {"isPermaLink": "false"}).text = f"websharr-{r.ident}"
         # The saved file keeps the raw filename; the folder/title (nzbname) carries
@@ -728,17 +822,24 @@ def _render_feed(request: Request, results: list[SearchResult], category: str,
         # policy grabs the original audio and skips the dub. A file named after
         # the Czech dub title ("Kačeří příběhy ...") is a Czech release even
         # when it carries no "dabing" marker.
-        item_lang = dub_language(r.name) or inferred or language
+        item_langs = [claimed or language] if claimed or language else []
+        # Measured metadata: the languages the audio tracks are tagged with, the
+        # name's dub claim first (never dropped: tags are sometimes missing or
+        # rewritten). Reported track metadata, not a verified dub.
+        tagged = track_languages(info.get("audio_languages"))
+        if tagged:
+            item_langs = ([claimed] if claimed else []) + [x for x in tagged if x != claimed]
         # Emit attrs in both namespaces so the feed parses whether Sonarr/Radarr
-        # treats it as Newznab (usenet — the correct choice) or Torznab.
+        # treats it as Newznab (usenet — the correct choice) or Torznab; one
+        # language attr per language, as *arr reads them.
         for ns in (NEWZNAB_NS, TORZNAB_NS):
             ET.SubElement(item, "{%s}attr" % ns, {"name": "category", "value": category})
             ET.SubElement(item, "{%s}attr" % ns, {"name": "size", "value": str(r.size)})
             ET.SubElement(item, "{%s}attr" % ns,
                           {"name": "grabs", "value": str(r.positive_votes)})
-            if item_lang:
+            for lang in item_langs:
                 ET.SubElement(item, "{%s}attr" % ns,
-                              {"name": "language", "value": item_lang})
+                              {"name": "language", "value": lang})
 
     return _xml_response(rss)
 
@@ -845,24 +946,29 @@ async def torznab_api(request: Request):
     logger.info("Newznab %s q=%r -> %d results", t, q, len(merged))
     # Opt-in: with an exact id, TMDB knows how long the title runs; files far
     # off that are another title that shares the name, a special or an excerpt.
-    # Off, nothing below asks TMDB or probes more than the labels need.
     check = settings.runtime_check and settings.tmdb_token and t in ("tvsearch", "movie") \
         and want_season != 0 and any(params.get(k) for k in ("tmdbid", "imdbid", "tvdbid"))
-    if not check:
+    # Opt-in: measure every shown file, not only names that lack a resolution
+    # or a language marker. Shares the runtime check's budget.
+    measure_all = settings.measured_metadata
+    # With all of these off, nothing below asks TMDB or probes more than the
+    # labels need.
+    if not check and not measure_all:
         shown = merged[:limit]
-        heights, audio, _lengths, _unfinished = await _probe(client, shown)
+        heights, audio, infos, _unfinished = await _probe(client, shown)
     else:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _RUNTIME_BUDGET
         kind = "tv" if t == "tvsearch" else "movie"
-        try:
-            minutes, exact = await asyncio.wait_for(tmdb_runtime(
-                settings.tmdb_token, kind, params.get("tmdbid"), params.get("imdbid"),
-                params.get("tvdbid"), season if t == "tvsearch" else None,
-                ep if t == "tvsearch" else None), timeout=_RUNTIME_BUDGET)
-        except asyncio.TimeoutError:
-            logger.info("TMDB runtime lookup outlived the budget: no runtime check")
-            minutes, exact = 0, False
+        minutes, exact = 0, False
+        if check:
+            try:
+                minutes, exact = await asyncio.wait_for(tmdb_runtime(
+                    settings.tmdb_token, kind, params.get("tmdbid"), params.get("imdbid"),
+                    params.get("tvdbid"), season if t == "tvsearch" else None,
+                    ep if t == "tvsearch" else None), timeout=_RUNTIME_BUDGET)
+            except asyncio.TimeoutError:
+                logger.info("TMDB runtime lookup outlived the budget: no runtime check")
         pages = 0
 
         async def more() -> list[SearchResult]:
@@ -885,15 +991,23 @@ async def torznab_api(request: Request):
             rank(new)
             return new
 
-        if minutes:
-            shown, heights, audio = await _runtime_filtered(
-                client, merged, limit, kind, minutes, exact, more, deadline)
+        def reject(r: SearchResult, info: dict) -> str:
+            """Why a measured file is dropped, "" to keep it."""
+            length = int(info.get("length") or 0)
+            if runtime_mismatch(length, minutes, kind, name=r.name, exact=exact):
+                return f"{length // 60} min, expected ~{minutes} min"
+            return ""
+
+        if minutes or measure_all:
+            shown, heights, audio, infos = await _measured(
+                client, merged, limit, reject, more, deadline)
         else:
             shown = merged[:limit]  # runtime unknown: label probes only, as with the check off
-            heights, audio, _lengths, _unfinished = await _probe(client, shown)
+            heights, audio, infos, _unfinished = await _probe(client, shown)
     return _render_feed(request, shown, category, heights=heights, audio=audio,
                         query=display, season=(season if t == "tvsearch" else None), ep=ep,
-                        episodes=episodes, language=language, czech_titles=czech_titles)
+                        episodes=episodes, language=language, czech_titles=czech_titles,
+                        infos=infos, metadata=settings.measured_metadata)
 
 
 @router.get("/torznab/nzb/{ident}")

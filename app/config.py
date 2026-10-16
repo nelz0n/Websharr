@@ -19,6 +19,10 @@ class Config:
         # Drop files whose duration is far off the TMDB runtime (opt-in, off by
         # default); the UI value in settings.json overrides this.
         self.runtime_check = os.environ.get("RUNTIME_CHECK", "").strip().lower() in ("1", "true", "yes", "on")
+        # Measure every shown file and add the reported codecs and audio-track
+        # languages to the feed (opt-in, off by default); the UI value wins.
+        self.measured_metadata = os.environ.get("MEASURED_METADATA", "").strip().lower() in (
+            "1", "true", "yes", "on")
         # Apprise notification URLs (comma/newline separated) and the VIP-expiry
         # warning threshold in days; UI values override these.
         self.notify_urls = [u.strip() for u in re.split(r"[,\n]", os.environ.get("NOTIFY_URLS", "")) if u.strip()]

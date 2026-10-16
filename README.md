@@ -153,6 +153,32 @@ without it (no runtime lookups, no extra probes).
 - The check gets 30 s per search: whatever isn't measured by then goes out
   unchecked rather than holding the search up (Sonarr gives an indexer 100 s).
 
+## Measured metadata (optional, off by default)
+
+Webshare's `file_info` is a media probe. Without any option, Websharr probes only
+the files whose name lacks a resolution (to label the quality) or a CZ/SK marker
+(to spot an unmarked dub). Turn on **Settings → Measured metadata** or
+`MEASURED_METADATA=true` (the UI value wins) and it measures **every** shown file
+and adds what the probe reports, only where the name doesn't already say it:
+
+- the **video codec** (`H264`, `H265`, `AV1`, `VP9`; never a bare `AVC`/`HEVC`,
+  which next to `BluRay` reads as a BR-DISK) and the **audio codec** of the best
+  track — of the CZ/SK track for a dub — as reported (`AC3`, `EAC3`, `DTS`,
+  `TrueHD`, `AAC`, `FLAC`, `Opus`, `MP3`). A name that tags either in any form
+  (`x264`, `HEVC`, `DD5.1`, `DDP`, `AC3`, `DTS-HD`, `TrueHD`, `Atmos`, `AAC2.0`,
+  …) keeps its own tag and gains nothing of that kind.
+- one `language` attribute per **tagged audio-track language** (`Czech` and
+  `English` for a dual-audio file), the name's CZ/SK claim first. This is the
+  track metadata as tagged, not a verified dub.
+
+The probe reports a channel *count*, not a layout, and no codec profile, so no
+channel layout (`5.1`, `7.1`) and no `DTS-HD MA` / `Atmos` is ever added; HDR/DV,
+bit depth and the source (WEB/BluRay) are not probed and never invented.
+
+Measuring shares the runtime check's budget of 30 s per search; files not
+measured by then go out unchanged, as do files whose probe fails. Probes are
+cached, limited process-wide, and parallel searches share one request per file.
+
 ## Monitoring and notifications
 
 - **Dashboard widget.** `GET /stats?apikey=…` returns compact JSON (active/queued
@@ -174,6 +200,7 @@ without it (no runtime lookups, no extra probes).
 | `WEBSHARR_API_KEY` | auto-generated | API key for the Newznab/SABnzbd endpoints; set to pin a fixed value |
 | `TMDB_TOKEN` | — | TMDB API Read Access Token for [Czech-title](#czech-titles-tmdb) lookups (UI value wins) |
 | `RUNTIME_CHECK` | `false` | `true` drops files far off the TMDB runtime ([runtime check](#runtime-check-optional-off-by-default); UI value wins) |
+| `MEASURED_METADATA` | `false` | `true` probes every shown file and adds the reported codecs and track languages ([measured metadata](#measured-metadata-optional-off-by-default); UI value wins) |
 | `NOTIFY_URLS` | — | Apprise URLs (comma-separated) for failure/VIP notifications (UI value wins) |
 | `NOTIFY_VIP_DAYS` | `7` | Warn when Webshare VIP has this many days left or fewer |
 | `SETTINGS_FILE` | `/config/settings.json` | persisted settings (UI account, Webshare login, API key) |

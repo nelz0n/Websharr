@@ -891,6 +891,24 @@
 
     <div class="scard">
       <div class="sinfo">
+        <h3>Measured metadata</h3>
+        <p class="shint">Webshare's file info is a media probe. Optionally, Websharr
+          measures <b>every</b> shown file (not only names without a resolution or
+          language) and adds what the probe reports when the name doesn't say it:
+          the <b>video and audio codec</b> to the release name and every <b>tagged
+          audio-track language</b> to the language attribute. Track tags are
+          metadata, not a verified dub. Off by default; measuring shares the
+          30&nbsp;s search budget, unmeasured files go out unchanged.</p>
+      </div>
+      <div class="sform">
+        <label class="scheck"><input id="set-measured-metadata" type="checkbox">
+          Add measured codecs and track languages</label>
+        <span class="sresult" id="set-measured-result"></span>
+      </div>
+    </div>
+
+    <div class="scard">
+      <div class="sinfo">
         <h3>Search aliases</h3>
         <p class="shint">Manual override/supplement to the TMDB lookup. Map
           <b>*arr title → Webshare (Czech) title</b> and Websharr also searches the
@@ -1157,6 +1175,7 @@ const App = {
       $("set-tmdb-token").placeholder = s.tmdb_token_set
         ? "•••••••• (set — leave empty to keep)" : "TMDB Read Access Token";
       $("set-runtime-check").checked = !!s.runtime_check;
+      $("set-measured-metadata").checked = !!s.measured_metadata;
       this.renderAliases(s.aliases || []);
     } catch (e) { /* offline banner already covers this */ }
   },
@@ -1788,6 +1807,17 @@ $("set-runtime-check").onchange = async (e) => {
   } catch (err) {
     e.target.checked = !on;
     sresult("set-runtime-result", false, err.message);
+  }
+};
+
+$("set-measured-metadata").onchange = async (e) => {
+  const on = e.target.checked;
+  try {
+    await uiPost("settings", { measured_metadata: on });
+    sresult("set-measured-result", true, on ? "✓ Measured metadata on" : "✓ Measured metadata off");
+  } catch (err) {
+    e.target.checked = !on;
+    sresult("set-measured-result", false, err.message);
   }
 };
 

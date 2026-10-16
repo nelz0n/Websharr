@@ -1084,3 +1084,211 @@ def test_runtime_check_off_without_known_runtime(client, fake_webshare, monkeypa
     fake_webshare.results = [SearchResult("spec", "Toy Story 1995 1080p CZ.mkv", 1_000_000_000)]
     fake_webshare.file_infos = {"spec": {"length": 60, "width": 1920, "height": 1080}}
     assert _feed(client, t="movie", tmdbid="862", cat="2000") == ["spec"]
+
+
+# --- measured metadata (opt-in) ----------------------------------------------
+
+_GB = 1024 ** 3
+
+
+def _info(**kw):
+    """A file_info record; `audio_languages` follows the tracks, as Webshare reports it."""
+    base = {"length": 6000, "width": 1920, "height": 1080, "format": "H264", "type": "mkv", "audio": []}
+    base.update(kw)
+    base.setdefault("audio_languages", [a["language"] for a in base["audio"] if a.get("language")])
+    return base
+
+
+def _track(fmt, channels, language=""):
+    return {"format": fmt, "channels": channels, "language": language}
+
+
+def _items(client, **params):
+    """{guid: (title, [language attrs])} of a feed."""
+    resp = client.get("/torznab/api", params={"apikey": "testkey", **params})
+    out = {}
+    for it in ET.fromstring(resp.content).findall("channel/item"):
+        langs = [a.get("value") for a in it.findall(f"{NZNS}attr") if a.get("name") == "language"]
+        out[it.findtext("guid").removeprefix("websharr-")] = (it.findtext("title"), langs)
+    return out
+
+
+def _counting_file_info(fake_webshare):
+    probed = []
+    real = fake_webshare.file_info
+
+    async def file_info(ident):
+        probed.append(ident)
+        return await real(ident)
+
+    fake_webshare.file_info = file_info
+    return probed
+
+
+def test_audio_codec_is_the_reported_codec_only():
+    """No layout from a channel count, no profile from a codec name: 8-channel
+    DTS stays "DTS" (not "DTS-HD MA 7.1"), 3 channels give no "2.1"."""
+    from app.torznab import audio_codec
+    assert audio_codec({"audio": [_track("DTS", 8)]}) == "DTS"
+    assert audio_codec({"audio": [_track("DTS", 6)]}) == "DTS"
+    assert audio_codec({"audio": [_track("AAC", 3)]}) == "AAC"
+    assert audio_codec({"audio": [_track("E-AC-3", 6)]}) == "EAC3"
+    tracks = [_track("TRUEHD", 8, "ENG"), _track("EAC3", 6, "CZE"), _track("AC3", 6, "SLO")]
+    assert audio_codec({"audio": tracks}) == "TrueHD"
+    assert audio_codec({"audio": tracks}, "Czech") == "EAC3"     # the dub's own track
+    assert audio_codec({"audio": tracks}, "Slovak") == "AC3"
+    assert audio_codec({"audio": [_track("WMA", 2)]}) == ""        # unknown codec: nothing
+    assert audio_codec({"audio": []}) == "" and audio_codec({}) == ""
+
+
+def test_measured_tags_never_add_over_a_named_tag():
+    """An audio tag in the name, in any spelling, suppresses the measured audio
+    codec (DD5.1 must not gain DDP5.1/EAC3); same for the video codec."""
+    from app.torznab import measured_tags
+    eac3 = _info(audio=[_track("EAC3", 6, "ENG")])
+    for name in ("Film 2020 1080p WEB DD5.1", "Film.2020.1080p.WEB.DD.5.1", "Film 2020 DD51",
+                 "Film 2020 DD+5.1", "Film 2020 DDP5.1", "Film.2020.DDP.Atmos", "Film 2020 AC3",
+                 "Film 2020 AC-3", "Film 2020 EAC3", "Film 2020 E-AC-3", "Film 2020 DTS",
+                 "Film 2020 DTS-HD MA 7.1", "Film 2020 DTSHD", "Film 2020 TrueHD 7.1",
+                 "Film 2020 Atmos", "Film 2020 AAC2.0", "Film_2020_AAC", "Film 2020 FLAC",
+                 "Film 2020 MP3", "Film 2020 Opus", "Film 2020 LPCM", "Film 2020 Dolby Digital"):
+        assert measured_tags(name + " x264", eac3) == [], name
+    for name in ("Film 2020 x264", "Film 2020 X265", "Film.2020.H.264", "Film 2020 h265",
+                 "Film 2020 HEVC", "Film 2020 AVC", "Film 2020 XviD", "Film 2020 AV1",
+                 "Film_2020_x264_"):
+        assert measured_tags(name + " AC3", eac3) == [], name
+    # nothing in the name: the reported codecs
+    assert measured_tags("Film 2020 1080p", eac3) == ["H264", "EAC3"]
+    assert measured_tags("Film 2020 1080p BluRay", _info(format="HEVC")) == ["H265"]  # not a bare HEVC
+    # words that merely contain a codec name don't count as a tag
+    assert measured_tags("Addams Family 1991 1080p", eac3) == ["H264", "EAC3"]
+
+
+def test_measured_metadata_is_off_by_default(client, fake_webshare, monkeypatch):
+    """Off (the default), probing and the feed are as without the feature: only
+    names lacking a resolution or a language marker are probed, nothing is
+    added to titles, one language attr."""
+    from app import torznab
+    from app.settings import settings
+    assert settings.measured_metadata is False
+    monkeypatch.setattr(settings, "aliases", [])
+    monkeypatch.setattr(settings, "tmdb_token", "")
+    probed = _counting_file_info(fake_webshare)
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [
+        SearchResult("named", "Hleda se Nemo 2003 1080p CZ.mkv", 8 * _GB),
+        SearchResult("bare", "Hleda se Nemo 2003.mkv", 7 * _GB),
+    ]
+    tracks = [_track("EAC3", 6, "CZE"), _track("TRUEHD", 8, "ENG")]
+    fake_webshare.file_infos = {"named": _info(audio=tracks), "bare": _info(audio=tracks)}
+    got = _items(client, t="movie", q="Hleda se Nemo")
+    assert probed == ["bare"]
+    assert set(torznab._probe_cache) == {"bare"}
+    assert got["named"] == ("Hleda se Nemo 2003 1080p CZ", ["Czech"])
+    assert got["bare"] == ("Hleda se Nemo 2003 1080p CZ", ["Czech"])
+    assert fake_webshare.searches == [("Hleda se Nemo", 60, 0)]
+
+
+def test_measured_metadata_adds_reported_codecs_and_track_languages(client, fake_webshare, monkeypatch):
+    """On, every shown file is measured (a cold cache: one probe each) and gets
+    the reported codecs it doesn't name, plus one language attr per tagged
+    track, the name's dub claim first. No extra Webshare pages are fetched."""
+    from app.settings import settings
+    monkeypatch.setattr(settings, "aliases", [])
+    monkeypatch.setattr(settings, "tmdb_token", "")
+    monkeypatch.setattr(settings, "measured_metadata", True)
+    probed = _counting_file_info(fake_webshare)
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [
+        SearchResult("dual", "Hleda se Nemo 2003 1080p CZ.mkv", 8 * _GB),
+        SearchResult("dd", "Hleda se Nemo 2003 1080p BluRay x264 DD5.1 CZ.mkv", 7 * _GB),
+        SearchResult("dts", "Hleda se Nemo 2003 2160p.mkv", 20 * _GB),
+        SearchResult("untagged", "Hleda se Nemo 2003 720p CZ dabing.mkv", 2 * _GB),
+    ]
+    fake_webshare.file_infos = {
+        "dual": _info(audio=[_track("TRUEHD", 8, "ENG"), _track("EAC3", 6, "CZE")]),
+        "dd": _info(audio=[_track("EAC3", 6, "CZE")]),
+        "dts": _info(width=3840, height=2160, format="HEVC", audio=[_track("DTS", 8, "ENG")]),
+        "untagged": _info(width=1280, height=720, audio=[_track("AAC", 2)]),
+    }
+    got = _items(client, t="movie", q="Hleda se Nemo", limit="10")
+    assert sorted(probed) == ["dd", "dts", "dual", "untagged"]
+    # the dub's own track, not the English TrueHD
+    assert got["dual"] == ("Hleda se Nemo 2003 1080p CZ H264 EAC3", ["Czech", "English"])
+    # the uploader's DD5.1 and x264 stay alone: no DDP5.1/EAC3, no H264
+    assert got["dd"] == ("Hleda se Nemo 2003 1080p BluRay x264 DD5.1 CZ", ["Czech"])
+    # 8-channel DTS is "DTS": no DTS-HD MA, no 7.1
+    assert got["dts"] == ("Hleda se Nemo 2003 2160p H265 DTS", ["English"])
+    # untagged tracks: the name's claim, as without the option
+    assert got["untagged"] == ("Hleda se Nemo 2003 720p CZ dabing H264 AAC", ["Czech"])
+    assert fake_webshare.searches == [("Hleda se Nemo", 10, 0)]
+
+
+def test_measured_metadata_fails_open_on_probe_errors(client, fake_webshare, monkeypatch):
+    """A file whose probe fails upstream goes out exactly as with the option off."""
+    import httpx
+    from app.settings import settings
+    monkeypatch.setattr(settings, "aliases", [])
+    monkeypatch.setattr(settings, "tmdb_token", "")
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [SearchResult("x", "Hleda se Nemo 2003 1080p CZ.mkv", 8 * _GB)]
+    off = _items(client, t="movie", q="Hleda se Nemo")
+
+    async def broken(ident):
+        raise httpx.ConnectError("webshare down")
+
+    fake_webshare.file_info = broken
+    monkeypatch.setattr(settings, "measured_metadata", True)
+    assert _items(client, t="movie", q="Hleda se Nemo") == off == {
+        "x": ("Hleda se Nemo 2003 1080p CZ", ["Czech"])}
+
+
+def test_measured_metadata_answers_within_the_budget(client, fake_webshare, monkeypatch):
+    """A probe that outlives the shared budget doesn't hold the search up: that
+    file goes out unchanged (fail open), the others are measured."""
+    import asyncio
+    import time
+    from app import torznab
+    from app.settings import settings
+    monkeypatch.setattr(settings, "aliases", [])
+    monkeypatch.setattr(settings, "tmdb_token", "")
+    monkeypatch.setattr(settings, "measured_metadata", True)
+    monkeypatch.setattr(torznab, "_RUNTIME_BUDGET", 0.5)
+    real = fake_webshare.file_info
+
+    async def file_info(ident):
+        if ident == "slow":
+            await asyncio.sleep(3600)
+        return await real(ident)
+
+    fake_webshare.file_info = file_info
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [
+        SearchResult("slow", "Hleda se Nemo 2003 2160p CZ.mkv", 20 * _GB),
+        SearchResult("fast", "Hleda se Nemo 2003 1080p CZ.mkv", 8 * _GB),
+    ]
+    fake_webshare.file_infos = {"fast": _info(audio=[_track("AC3", 6, "CZE")])}
+    started = time.monotonic()
+    got = _items(client, t="movie", q="Hleda se Nemo")
+    assert time.monotonic() - started < 5
+    assert got == {"slow": ("Hleda se Nemo 2003 2160p CZ", ["Czech"]),
+                   "fast": ("Hleda se Nemo 2003 1080p CZ H264 AC3", ["Czech"])}
+
+
+def test_runtime_check_and_measured_metadata_share_one_pass(client, fake_webshare, monkeypatch):
+    """Both on: each file is probed once, the runtime check drops what is far off
+    and the kept files carry the measured codecs."""
+    from app.settings import settings
+    _enable_runtime_check(monkeypatch, _TOY_STORY, 81)
+    monkeypatch.setattr(settings, "measured_metadata", True)
+    probed = _counting_file_info(fake_webshare)
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [
+        SearchResult("full", "Toy Story 1995 1080p CZ.mkv", 4 * _GB),
+        SearchResult("spec", "Toy Story 1995 extra 1080p CZ.mkv", 1 * _GB),
+    ]
+    fake_webshare.file_infos = {"full": _info(length=81 * 60, audio=[_track("AC3", 6, "CZE")]),
+                                "spec": _info(length=10 * 60)}
+    got = _items(client, t="movie", tmdbid="862", cat="2000")
+    assert got == {"full": ("Toy Story 1995 1080p CZ H264 AC3", ["Czech"])}
+    assert sorted(probed) == ["full", "spec"]

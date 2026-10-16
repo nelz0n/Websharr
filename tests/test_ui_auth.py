@@ -166,6 +166,47 @@ def test_runtime_check_env_default(monkeypatch, tmp_path):
     assert fresh.runtime_check is True
 
 
+def test_measured_metadata_setting_defaults_off_validates_and_persists(client, monkeypatch):
+    import json
+
+    from app.config import config
+    from app.settings import settings
+
+    _setup(client)
+    assert client.get("/ui/api/settings").json()["measured_metadata"] is False
+    assert 'id="set-measured-metadata"' in client.get("/ui").text
+
+    assert client.post("/ui/api/settings", json={"measured_metadata": True}).status_code == 200
+    assert client.get("/ui/api/settings").json()["measured_metadata"] is True
+    assert json.loads(config.settings_file.read_text())["measured_metadata"] is True
+
+    rejected = client.post("/ui/api/settings", json={"measured_metadata": "yes"})
+    assert rejected.status_code == 400
+    assert settings.measured_metadata is True
+
+    # A saved "off" wins over an env default of "on" after a restart.
+    client.post("/ui/api/settings", json={"measured_metadata": False})
+    monkeypatch.setattr(config, "measured_metadata", True)
+    settings.load()
+    assert settings.measured_metadata is False
+
+
+def test_measured_metadata_env_default(monkeypatch, tmp_path):
+    from app.config import Config, config
+    from app.settings import Settings
+
+    monkeypatch.delenv("MEASURED_METADATA", raising=False)
+    assert Config().measured_metadata is False
+    monkeypatch.setenv("MEASURED_METADATA", "true")
+    assert Config().measured_metadata is True
+
+    monkeypatch.setattr(config, "settings_file", tmp_path / "settings.json")
+    monkeypatch.setattr(config, "measured_metadata", True)
+    fresh = Settings()
+    fresh.load()
+    assert fresh.measured_metadata is True
+
+
 def test_webshare_password_never_stored_in_plaintext(client):
     from app.config import config
     import json
