@@ -200,12 +200,37 @@ def _asciify(text: str) -> str:
     return re.sub(r"\s{2,}", " ", text).strip()
 
 
-# An episode marker in a file name with an optional second number: a range /
-# double episode ("S01E01-E02", "S01E01E02", "1x01-02") or a total ("S01E23-26",
-# "S01E23 z 26", "S01E23 of 26", "S01E23/26").
+# An episode marker in a file name with what may follow it: a total ("S01E23 z 26",
+# "S01E23 of 26", "S01E23/26" — the season's episode count, never an episode),
+# an explicit E endpoint ("S01E01-E03", "S01E01E02") or a bare hyphen range
+# ("S01E01-03", "1x01-03"). A bare hyphen is a range, as in Sonarr's parser,
+# even where a Czech upload meant "part 23 of 26" by "S01E23-26": the two are
+# indistinguishable, and Sonarr reads the range anyway.
 _MARKER_RE = re.compile(
-    r"\b(?:s\d{1,2}e(?P<ep1>\d{1,3})|\d{1,2}x(?P<ep2>\d{1,3}))"
-    r"(?:(?:\s*[-–/]\s*|\s+(?:z|of|ze)\s+)e?(?P<to>\d{1,3})|e(?P<to2>\d{1,3}))?\b", re.I)
+    r"\b(?P<marker>s(?P<s1>\d{1,2})e(?P<e1>\d{1,3})|(?P<s2>\d{1,2})x(?P<e2>\d{1,3}))"
+    r"(?:(?:\s*/\s*|\s+(?:of|ze?)\s+)(?P<total>\d{1,3})"
+    r"|(?:[-–]?e(?P<end>\d{1,3}))+"
+    r"|[-–](?P<bare>\d{2,3}))?\b", re.I)
+
+
+def _marker_episodes(m: re.Match) -> tuple[int, int, int]:
+    """(season, first, last) episode of a _MARKER_RE match; last == first for a
+    single episode, also one followed by a total."""
+    first = int(m.group("e1") or m.group("e2"))
+    end = m.group("end") or m.group("bare")
+    last = int(end) if end and int(end) > first else first
+    return int(m.group("s1") or m.group("s2")), first, last
+
+
+def _drop_marker(m: re.Match) -> str:
+    """Replacement for a _MARKER_RE match: the marker goes with its total or
+    range; a suffix that is neither (an end before the start, a "total" below
+    the episode) stays in the name, as it did before."""
+    first = int(m.group("e1") or m.group("e2"))
+    total, end = m.group("total"), m.group("end") or m.group("bare")
+    if (total and int(total) < first) or (end and int(end) < first):
+        return m.group(0)[m.end("marker") - m.start():]
+    return ""
 
 
 def release_title(query: str, season: str | None, ep: str | None, name: str) -> str:
@@ -229,21 +254,21 @@ def release_title(query: str, season: str | None, ep: str | None, name: str) -> 
         try:
             e = int(ep)
             prefix = f"{q} S{s:02d}E{e:02d}"
-            # "S01E01-E02" / "S01E01E02": a real double episode stays one
-            file_ep = marker and int(marker.group("ep1") or marker.group("ep2"))
-            to = marker and (marker.group("to") or marker.group("to2"))
-            if to and file_ep == e and int(to) == e + 1:
-                prefix += f"-E{e + 1:02d}"
+            # A multi-episode file keeps its range ("S01E01-E03"), so *arr maps
+            # it to every episode it holds — never extended past what it names.
+            if marker:
+                m_season, m_first, m_last = _marker_episodes(marker)
+                if (m_season, m_first) == (s, e) and m_last > e:
+                    prefix += f"-E{m_last:02d}"
         except (TypeError, ValueError):
             prefix = f"{q} S{s:02d}"
     else:
         prefix = f"{q} S{s:02d}"
     # Strip any SxxEyy/1x02 already in the filename so the release doesn't carry
     # two episode markers (confuses *arr's parser: "unable to determine episode")
-    # — with what follows it: a range, or the season's episode count of Czech
-    # uploads ("S01E23-26" = part 23 of 26), which a left-over "-26" turned into
-    # an episode range Sonarr then refused to import ("unexpected episodes").
-    stem = _MARKER_RE.sub("", stem)
+    # — with what follows it: a range (carried by the prefix above), or a total
+    # ("S01E23 z 26"), whose left-over "26" read as one more episode.
+    stem = _MARKER_RE.sub(_drop_marker, stem)
     stem = re.sub(r"\.{2,}", ".", stem)          # double dots left by the removal
     stem = re.sub(r"\s{2,}", " ", stem).strip(" .-")
     return _asciify(f"{prefix} - {stem}".strip(" -"))
@@ -463,7 +488,9 @@ def file_marker(query, name: str) -> tuple[int | None, int | None]:
             if tk in ("special", "specials"):
                 is_special = True
                 continue
-            m = re.match(r"^s(\d{1,2})e(\d{1,3})$", tk) or re.match(r"^(\d{1,2})x(\d{1,3})$", tk)
+            # "s01e01e02" (a compact double) counts as its first episode
+            m = re.match(r"^s(\d{1,2})e(\d{1,3})(?:e\d{1,3})*$", tk) or \
+                re.match(r"^(\d{1,2})x(\d{1,3})$", tk)
             if m:
                 return int(m.group(1)), int(m.group(2))
             if tk.isdigit() and len(tk) <= 2:  # bare episode number (skip years/1080)
