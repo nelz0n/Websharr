@@ -5,6 +5,7 @@ fetched per-user from /api/salt/. Responses are XML.
 """
 
 import asyncio
+import copy
 import hashlib
 import logging
 import time
@@ -18,6 +19,9 @@ logger = logging.getLogger("websharr.webshare")
 API_BASE = "https://webshare.cz/api"
 TOKEN_TTL = 30 * 60  # re-login after 30 minutes
 SEARCH_CACHE_SIZE = 500  # cached searches kept; the oldest go first
+# An empty answer is the one most likely to change soon (a fresh upload), so
+# it is kept for at most this long even with a longer search_cache_ttl.
+SEARCH_CACHE_EMPTY_TTL = 60
 
 ITOA64 = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
@@ -109,6 +113,12 @@ def _text(root: ET.Element, tag: str, default: str = "") -> str:
     return el.text if el is not None and el.text is not None else default
 
 
+def _copies(results: tuple[SearchResult, ...]) -> list[SearchResult]:
+    """Fresh list of fresh objects: a cached or shared result is never handed
+    out itself, so no caller can change what later callers get."""
+    return [copy.copy(r) for r in results]
+
+
 class WebshareClient:
     def __init__(self, username: str, password: str, password_digest: str = "",
                  search_cache_ttl: float = 0):
@@ -120,10 +130,16 @@ class WebshareClient:
         self._token: str | None = None
         self._token_ts: float = 0.0
         self._login_lock = asyncio.Lock()
+        # Bumped whenever the account actually changes. Cached and in-flight
+        # searches carry the generation they were started under, so nothing
+        # fetched with the old account is served or stored after a switch.
+        self._cred_gen = 0
         # *arr fire the same search over and over (per episode, season search,
         # Prowlarr retries) and Webshare answers bursts with 403, so identical
-        # searches are served from memory for search_cache_ttl seconds (0 = off).
+        # searches can be served from memory for search_cache_ttl seconds
+        # (0 = off, the default: every search goes to Webshare).
         self._search_ttl = search_cache_ttl
+        # key -> (expires at, results); key = (generation, *search params)
         self._search_cache: OrderedDict[tuple, tuple[float, tuple[SearchResult, ...]]] = OrderedDict()
         self._search_inflight: dict[tuple, asyncio.Task] = {}
         self._http = httpx.AsyncClient(
@@ -137,7 +153,18 @@ class WebshareClient:
 
     def set_credentials(self, username: str, password: str = "",
                         password_digest: str = "") -> None:
-        """Swap the account at runtime (settings change); drops the token."""
+        """Swap the account at runtime (settings change); drops the token.
+
+        Every settings save calls this, so the search cache is only dropped
+        when the credentials really differ from the current ones.
+        """
+        if (username, password, password_digest) != (
+                self._username, self._password, self._password_digest):
+            self._cred_gen += 1
+            self._search_cache.clear()
+            # Running searches finish for their callers but are no longer
+            # joinable, and _search_done won't cache them (stale generation).
+            self._search_inflight.clear()
         self._username = username
         self._password = password
         self._password_digest = password_digest
@@ -191,7 +218,14 @@ class WebshareClient:
     async def _get_token(self, force: bool = False) -> str:
         async with self._login_lock:
             if force or not self._token or time.monotonic() - self._token_ts > TOKEN_TTL:
-                self._token = await self._login()
+                while True:
+                    gen = self._cred_gen
+                    token = await self._login()
+                    # Credentials changed while logging in: that token belongs
+                    # to the old account, log in again with the new one.
+                    if gen == self._cred_gen:
+                        break
+                self._token = token
                 self._token_ts = time.monotonic()
             return self._token
 
@@ -217,26 +251,32 @@ class WebshareClient:
         }
         if self._search_ttl <= 0:
             return list(await self._search(data))
-        key = tuple(data.values())
+        gen = self._cred_gen
+        key = (gen, *data.values())
         hit = self._search_cache.get(key)
-        if hit and time.monotonic() - hit[0] < self._search_ttl:
+        if hit and time.monotonic() < hit[0]:
             logger.debug("Search cache hit: %r (limit=%d, offset=%d)", query, limit, offset)
-            return list(hit[1])
-        # An identical search already on its way to Webshare: wait for it
-        # instead of sending another. shield() so one caller giving up (client
-        # disconnect) doesn't cancel the request for the others.
+            return _copies(hit[1])
+        # An identical search already on its way to Webshare under the same
+        # account: wait for it instead of sending another. shield() so one
+        # caller giving up (client disconnect) doesn't cancel it for the others.
         task = self._search_inflight.get(key)
         if task is None:
             task = asyncio.ensure_future(self._search(data))
             self._search_inflight[key] = task
             task.add_done_callback(lambda t: self._search_done(key, t))
-        return list(await asyncio.shield(task))
+        return _copies(await asyncio.shield(task))
 
     def _search_done(self, key: tuple, task: asyncio.Task) -> None:
-        self._search_inflight.pop(key, None)
+        if self._search_inflight.get(key) is task:
+            del self._search_inflight[key]
         if task.cancelled() or task.exception() is not None:
             return  # errors are never cached; the next call asks Webshare again
-        self._search_cache[key] = (time.monotonic(), task.result())
+        if key[0] != self._cred_gen:
+            return  # started under credentials that have since changed
+        results = task.result()
+        ttl = min(self._search_ttl, SEARCH_CACHE_EMPTY_TTL) if not results else self._search_ttl
+        self._search_cache[key] = (time.monotonic() + ttl, results)
         self._search_cache.move_to_end(key)
         while len(self._search_cache) > SEARCH_CACHE_SIZE:
             self._search_cache.popitem(last=False)
