@@ -179,6 +179,24 @@ Measuring shares the runtime check's budget of 30 s per search; files not
 measured by then go out unchanged, as do files whose probe fails. Probes are
 cached, limited process-wide, and parallel searches share one request per file.
 
+### Quality heuristics (optional, off by default)
+
+Inferences from the measurement rather than measurements, so they have their own
+switch — **Settings → Measured metadata → Correct overstated resolutions and mark
+upscales**, or `QUALITY_HEURISTICS=true` (the UI value wins). Like the measured
+metadata they measure every shown file within the same budget:
+
+- a resolution the name **overstates** (`4K`/`UHD`/`2160p` with 1080p inside, a
+  `1080p` with 720p inside) is replaced by the measured class; 4:3 (1440×1080) and
+  cropped widescreen (1920×800) keep theirs, and an understated name is left
+  alone.
+- **`Upscaled`** (scored by TRaSH's *Upscaled* custom format) when the name says
+  it is an AI upscale (`AI.Upscale`, `AIUS`, `1080p.AI.WEB`, …; titles like *Ai
+  Weiwei* or *A.I.* don't count, nor does `Regrade`, which is colour grading), or
+  when a measured 2160p H.264/H.265 file runs below 30 MiB per minute. Bitrate
+  alone can't prove an upscale, which is why this is opt-in; AV1/VP9 files are
+  never judged by bitrate.
+
 ## Monitoring and notifications
 
 - **Dashboard widget.** `GET /stats?apikey=…` returns compact JSON (active/queued
@@ -201,6 +219,7 @@ cached, limited process-wide, and parallel searches share one request per file.
 | `TMDB_TOKEN` | — | TMDB API Read Access Token for [Czech-title](#czech-titles-tmdb) lookups (UI value wins) |
 | `RUNTIME_CHECK` | `false` | `true` drops files far off the TMDB runtime ([runtime check](#runtime-check-optional-off-by-default); UI value wins) |
 | `MEASURED_METADATA` | `false` | `true` probes every shown file and adds the reported codecs and track languages ([measured metadata](#measured-metadata-optional-off-by-default); UI value wins) |
+| `QUALITY_HEURISTICS` | `false` | `true` corrects overstated resolutions and marks upscales ([quality heuristics](#quality-heuristics-optional-off-by-default); UI value wins) |
 | `NOTIFY_URLS` | — | Apprise URLs (comma-separated) for failure/VIP notifications (UI value wins) |
 | `NOTIFY_VIP_DAYS` | `7` | Warn when Webshare VIP has this many days left or fewer |
 | `SETTINGS_FILE` | `/config/settings.json` | persisted settings (UI account, Webshare login, API key) |

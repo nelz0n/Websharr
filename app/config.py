@@ -23,6 +23,10 @@ class Config:
         # languages to the feed (opt-in, off by default); the UI value wins.
         self.measured_metadata = os.environ.get("MEASURED_METADATA", "").strip().lower() in (
             "1", "true", "yes", "on")
+        # Inferences from the measurement: correct an overstated resolution and
+        # mark upscales (opt-in, off by default); the UI value wins.
+        self.quality_heuristics = os.environ.get("QUALITY_HEURISTICS", "").strip().lower() in (
+            "1", "true", "yes", "on")
         # Apprise notification URLs (comma/newline separated) and the VIP-expiry
         # warning threshold in days; UI values override these.
         self.notify_urls = [u.strip() for u in re.split(r"[,\n]", os.environ.get("NOTIFY_URLS", "")) if u.strip()]

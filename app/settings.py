@@ -67,6 +67,10 @@ class Settings:
         # and audio-track languages to the feed. Off unless enabled (env var
         # MEASURED_METADATA is the initial default, the UI toggle overrides it).
         self.measured_metadata: bool = config.measured_metadata
+        # Quality heuristics: correct an overstated resolution claim and mark
+        # upscales. Inferences, not measurements, so off unless enabled (env var
+        # QUALITY_HEURISTICS, the UI toggle overrides it).
+        self.quality_heuristics: bool = config.quality_heuristics
         # Concurrent-download limit; env var is the initial default, editable in
         # the UI (Settings and the Queue page).
         self.max_concurrent: int = config.max_concurrent
@@ -106,6 +110,8 @@ class Settings:
         self.runtime_check = check if isinstance(check, bool) else config.runtime_check
         metadata = data.get("measured_metadata")
         self.measured_metadata = metadata if isinstance(metadata, bool) else config.measured_metadata
+        heuristics = data.get("quality_heuristics")
+        self.quality_heuristics = heuristics if isinstance(heuristics, bool) else config.quality_heuristics
         try:
             self.max_concurrent = max(1, int(data.get("max_concurrent") or config.max_concurrent))
         except (TypeError, ValueError):
@@ -135,6 +141,7 @@ class Settings:
             "tmdb_token": self.tmdb_token,
             "runtime_check": self.runtime_check,
             "measured_metadata": self.measured_metadata,
+            "quality_heuristics": self.quality_heuristics,
             "max_concurrent": self.max_concurrent,
             "notify_urls": self.notify_urls,
             "notify_vip_days": self.notify_vip_days,

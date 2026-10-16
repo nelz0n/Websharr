@@ -1292,3 +1292,97 @@ def test_runtime_check_and_measured_metadata_share_one_pass(client, fake_webshar
     got = _items(client, t="movie", tmdbid="862", cat="2000")
     assert got == {"full": ("Toy Story 1995 1080p CZ H264 AC3", ["Czech"])}
     assert sorted(probed) == ["full", "spec"]
+
+
+# --- quality heuristics (opt-in) ---------------------------------------------
+
+def test_quality_heuristics_correct_an_overstated_resolution():
+    from app.torznab import quality_heuristics
+    assert quality_heuristics("Film 2020 4K CZ", 8 * _GB, _info())[0] == "Film 2020 1080p CZ"
+    # any overstated claim, not only 4K; one resolution token left, never two
+    assert quality_heuristics("Film 2020 1080p CZ", 4 * _GB, _info(width=1280, height=720))[0] == \
+        "Film 2020 720p CZ"
+    assert quality_heuristics("Film.2020.4K.UHD.x265", 8 * _GB, _info())[0] == "Film.2020.1080p.x265"
+    assert quality_heuristics("Film 2020 1080p 4K", 8 * _GB, _info())[0] == "Film 2020 1080p"
+    # 4:3 1440x1080 and cropped 1920x800 are 1080p; an understated name stays
+    assert quality_heuristics("Film 1943 1080p", 6 * _GB, _info(width=1440, height=1080))[0] == \
+        "Film 1943 1080p"
+    assert quality_heuristics("Film 2020 1080p", 6 * _GB, _info(width=1920, height=800))[0] == \
+        "Film 2020 1080p"
+    assert quality_heuristics("Film 2020 720p", 6 * _GB, _info())[0] == "Film 2020 720p"
+    # nothing measured: nothing corrected
+    assert quality_heuristics("Film 2020 4K", 8 * _GB, {}) == ("Film 2020 4K", [])
+
+
+def test_quality_heuristics_upscaled():
+    """Bitrate only judges a measured 2160p H264/H265; an AI upscale named in
+    the release counts even unprobed; Regrade is not an upscale."""
+    from app.torznab import quality_heuristics, upscale_claim
+    uhd = {"width": 3840, "height": 2160, "length": 6000}   # 100 minutes
+    assert quality_heuristics("Kaceri pribehy 2160p", 2 * _GB, _info(**uhd, format="HEVC"))[1] == \
+        ["Upscaled"]                                          # 20 MiB/min
+    assert quality_heuristics("Film 2160p", 20 * _GB, _info(**uhd, format="HEVC"))[1] == []
+    assert quality_heuristics("Film 2160p AV1", 2 * _GB, _info(**uhd, format="AV1"))[1] == []
+    assert quality_heuristics("Film 1080p", 1 * _GB, _info())[1] == []   # not UHD: not judged
+    assert upscale_claim("DuckTales.Maid.Of.The.Myth.CZECH.1080p.AI.WEB.H264-ZEPPELiN")
+    assert upscale_claim("Vinnetou.1963.CZ.EN.Blu-Ray.AI.Upscale.2160p.x265")
+    assert upscale_claim("Film AIUS 2160p")
+    assert not upscale_claim("Film 1985 Regrade 1080p")
+    assert not upscale_claim("Ai Weiwei Never Sorry 2012 1080p")
+    assert not upscale_claim("A.I. Artificial Intelligence 2001 1080p")
+    assert quality_heuristics("Film 1080p AI WEB", 1, {}) == ("Film 1080p AI WEB", ["Upscaled"])
+    # already named Upscaled: not doubled
+    assert quality_heuristics("Film 2160p Upscaled", 2 * _GB, _info(**uhd))[1] == []
+
+
+def test_uhd_av1_is_not_called_upscaled_by_default(client, fake_webshare, monkeypatch):
+    """Reviewer case: a measured 2160p AV1 of 2 GiB over 100 minutes. Neither
+    the default nor the measured metadata calls it Upscaled; bitrate alone
+    can't show the source resolution. Same for an H265 file of that size
+    unless the heuristics are turned on."""
+    from app.settings import settings
+    monkeypatch.setattr(settings, "aliases", [])
+    monkeypatch.setattr(settings, "tmdb_token", "")
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [SearchResult("av1", "Film 2020 2160p.mkv", 2 * _GB),
+                             SearchResult("hevc", "Film 2020 2160p CZ.mkv", 2 * _GB)]
+    uhd = {"width": 3840, "height": 2160, "length": 6000}
+    fake_webshare.file_infos = {"av1": _info(**uhd, format="AV1"), "hevc": _info(**uhd, format="HEVC")}
+    titles = lambda: {g: t for g, (t, _l) in _items(client, t="movie", q="Film").items()}  # noqa: E731
+    assert titles() == {"av1": "Film 2020 2160p", "hevc": "Film 2020 2160p CZ"}
+    monkeypatch.setattr(settings, "measured_metadata", True)
+    assert titles() == {"av1": "Film 2020 2160p AV1", "hevc": "Film 2020 2160p CZ H265"}
+    monkeypatch.setattr(settings, "measured_metadata", False)
+    monkeypatch.setattr(settings, "quality_heuristics", True)
+    assert titles() == {"av1": "Film 2020 2160p", "hevc": "Film 2020 2160p CZ Upscaled"}
+
+
+def test_quality_heuristics_in_the_feed(client, fake_webshare, monkeypatch):
+    """On, every shown file is measured: a named "4K" that is 1080p inside is
+    relabelled, an AI upscale named in the release is marked even when its
+    probe fails; a file whose probe fails otherwise goes out unchanged."""
+    import httpx
+    from app.settings import settings
+    monkeypatch.setattr(settings, "aliases", [])
+    monkeypatch.setattr(settings, "tmdb_token", "")
+    monkeypatch.setattr(settings, "quality_heuristics", True)
+    real = fake_webshare.file_info
+
+    async def file_info(ident):
+        if ident in ("ai", "broken"):
+            raise httpx.ConnectError("webshare down")
+        return await real(ident)
+
+    fake_webshare.file_info = file_info
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [
+        SearchResult("fake4k", "Film 2020 4K CZ.mkv", 8 * _GB),
+        SearchResult("ai", "Film 2020 1080p AI WEB CZ.mkv", 4 * _GB),
+        SearchResult("broken", "Film 2020 4K EN.mkv", 3 * _GB),
+    ]
+    fake_webshare.file_infos = {"fake4k": _info()}
+    titles = {g: t for g, (t, _l) in _items(client, t="movie", q="Film").items()}
+    # (a bare "4K" isn't a resolution label, so the measured "1080p" is appended
+    # as without the option; the heuristics then drop the false "4K")
+    assert titles == {"fake4k": "Film 2020 CZ 1080p", "ai": "Film 2020 1080p AI WEB CZ Upscaled",
+                      "broken": "Film 2020 4K EN"}

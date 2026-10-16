@@ -183,6 +183,7 @@ async def ui_settings_get(request: Request):
         "tmdb_token_set": bool(settings.tmdb_token),
         "runtime_check": settings.runtime_check,
         "measured_metadata": settings.measured_metadata,
+        "quality_heuristics": settings.quality_heuristics,
         "max_concurrent": request.app.state.downloads.max_concurrent,
         "notify_urls": settings.notify_urls,
         "notify_vip_days": settings.notify_vip_days,
@@ -265,6 +266,11 @@ async def ui_settings_post(request: Request):
         if not isinstance(body.get("measured_metadata"), bool):
             return JSONResponse({"error": "measured_metadata must be true or false"}, status_code=400)
         settings.measured_metadata = body["measured_metadata"]
+
+    if "quality_heuristics" in body:
+        if not isinstance(body.get("quality_heuristics"), bool):
+            return JSONResponse({"error": "quality_heuristics must be true or false"}, status_code=400)
+        settings.quality_heuristics = body["quality_heuristics"]
 
     if "max_concurrent" in body:
         try:

@@ -733,6 +733,89 @@ def measured_tags(name: str, info: dict, prefer: str = "") -> list[str]:
     return tokens
 
 
+# --- quality heuristics (opt-in, settings.quality_heuristics) -----------------
+# Unlike the measured metadata above, these are inferences: they rewrite a
+# resolution the uploader claimed, or call a file an upscale. Each can be wrong
+# for some file, so they stay behind their own switch, off by default.
+
+# A resolution the name claims: a height ("1080p", "1080") or "4K"/"UHD" (2160).
+_RES_CLAIM_RE = re.compile(r"(?<![a-z0-9])(?:(480|540|576|720|1080|2160|4320)p?|4k|uhd)(?![a-z0-9])", re.I)
+_UPSCALED_RE = re.compile(r"(?<![a-z0-9])upscaled(?![a-z0-9])", re.I)
+# Below this bitrate (MiB per minute) an H264/H265 "2160p" is taken for an
+# upscale; a real UHD encode of those codecs runs well above it. AV1/VP9 and
+# unknown codecs are never judged by bitrate (no floor fits them).
+_UHD_FLOOR = 30
+_UHD_FLOOR_CODECS = ("H264", "H265")
+# Uploaders mark AI upscales in the name ("1080p.AI.WEB", "AI.Upscale.2160p");
+# TRaSH's Upscaled custom format misses the bare "AI" form. A lone "AI" only
+# counts next to a resolution/source/codec tag, so "Ai Weiwei" or "A.I." stay
+# untouched. "Regrade" is colour grading, not an upscale, and doesn't count.
+_UPSCALE_WORDS = frozenset({"upscale", "upscaled", "upscaling", "aius"})
+_AI_NEIGHBOURS = frozenset({"web", "webrip", "webdl", "dl", "bluray", "bdrip", "brrip", "hdtv", "uhd", "fhd",
+                            "4k", "enhanced", "x264", "x265", "h264", "h265", "hevc", "avc"})
+_RES_TOKEN_RE = re.compile(r"^\d{3,4}p$")
+
+
+def upscale_claim(name: str) -> bool:
+    """True when the name itself says the picture is an (AI) upscale."""
+    toks = [x for x in re.split(r"[^a-z0-9]+", name.lower()) if x]
+    for i, tok in enumerate(toks):
+        if tok in _UPSCALE_WORDS:
+            return True
+        if tok == "ai" and any(n in _AI_NEIGHBOURS or _RES_TOKEN_RE.match(n)
+                               for n in toks[max(0, i - 1):i + 2]):
+            return True
+    return False
+
+
+def _correct_resolution(name: str, measured: int) -> str:
+    """`name` without the resolution claims above the `measured` class; when no
+    truthful claim is left, the first overstated one becomes the measured class,
+    so the name keeps exactly one resolution token."""
+    claims = [(m, int(m.group(1)) if m.group(1) else 2160) for m in _RES_CLAIM_RE.finditer(name)]
+    over = [m for m, height in claims if height > measured]
+    if not over:
+        return name
+    say_measured = len(over) == len(claims)
+    out, pos = [], 0
+    for m in over:
+        start = m.start()
+        if say_measured:
+            out.append(name[pos:start] + f"{measured}p")
+            say_measured = False
+        else:
+            # drop the token and the separator before it ("4K.UHD" -> "4K")
+            out.append(name[pos:start - 1 if start and name[start - 1] in " ._" else start])
+        pos = m.end()
+    return "".join(out) + name[pos:]
+
+
+def _mib_per_min(size: int, length_s: int) -> float:
+    return size / 1048576 / (length_s / 60) if size and length_s else 0.0
+
+
+def quality_heuristics(name: str, size: int, info: dict) -> tuple[str, list[str]]:
+    """(name with an overstated resolution corrected, extra tokens).
+
+    - a resolution claim ("4K"/"UHD"/"2160p"/"1080p"…) above the measured class
+      is replaced by it (a 1080p inside a "4K" name, a 720p inside a "1080p"
+      one); 4:3 and cropped widescreen keep their class, an understated name
+      is left alone
+    - "Upscaled" when the name says it is an AI upscale (also unprobed), or
+      for a measured 2160p H264/H265 file below a real UHD bitrate
+    """
+    tokens: list[str] = []
+    measured = resolution_class(int(info.get("width") or 0), int(info.get("height") or 0))
+    if measured:
+        name = _correct_resolution(name, measured)
+    if not _UPSCALED_RE.search(name):
+        mibmin = _mib_per_min(size, int(info.get("length") or 0))
+        if upscale_claim(name) or (measured >= 2160 and video_codec(info) in _UHD_FLOOR_CODECS
+                                   and 0 < mibmin < _UHD_FLOOR):
+            tokens.append("Upscaled")
+    return name, tokens
+
+
 # Window the synthetic publish dates fall into (see _pub_date).
 _PUB_EPOCH = 1640995200  # 2022-01-01 UTC
 _PUB_SPAN = 365 * 86400
@@ -757,11 +840,14 @@ def _render_feed(request: Request, results: list[SearchResult], category: str,
                  ep: str | None = None, episodes: dict[str, int] | None = None,
                  heights: dict[str, int] | None = None, audio: dict[str, str] | None = None,
                  language: str = "", czech_titles: list[str] | None = None,
-                 infos: dict[str, dict] | None = None, metadata: bool = False) -> Response:
+                 infos: dict[str, dict] | None = None, metadata: bool = False,
+                 heuristics: bool = False) -> Response:
     """`metadata` (the measured-metadata opt-in) adds what `infos` reports: the
-    codecs to the title, every tagged audio language to the language attrs."""
+    codecs to the title, every tagged audio language to the language attrs.
+    `heuristics` (the quality-heuristics opt-in) corrects an overstated
+    resolution and marks upscales (see quality_heuristics)."""
     heights = heights or {}
-    infos = infos if metadata and infos else {}
+    infos = infos or {}
     audio = audio or {}
     episodes = episodes or {}
     ET.register_namespace("torznab", TORZNAB_NS)
@@ -793,9 +879,12 @@ def _render_feed(request: Request, results: list[SearchResult], category: str,
             title = f"{title} {marker}"
         info = infos.get(r.ident, {})
         claimed = dub_language(r.name) or inferred
+        upscaled: list[str] = []
+        if heuristics:
+            title, upscaled = quality_heuristics(title, r.size, info)
         # The audio codec of the CZ/SK track when the release is a dub: that's
         # the track a CZ profile cares about.
-        extra = measured_tags(title, info, claimed) if info else []
+        extra = (measured_tags(title, info, claimed) if metadata and info else []) + upscaled
         if extra:
             title = f"{title} {' '.join(extra)}"
         ET.SubElement(item, "title").text = title
@@ -826,7 +915,7 @@ def _render_feed(request: Request, results: list[SearchResult], category: str,
         # Measured metadata: the languages the audio tracks are tagged with, the
         # name's dub claim first (never dropped: tags are sometimes missing or
         # rewritten). Reported track metadata, not a verified dub.
-        tagged = track_languages(info.get("audio_languages"))
+        tagged = track_languages(info.get("audio_languages")) if metadata else []
         if tagged:
             item_langs = ([claimed] if claimed else []) + [x for x in tagged if x != claimed]
         # Emit attrs in both namespaces so the feed parses whether Sonarr/Radarr
@@ -948,9 +1037,9 @@ async def torznab_api(request: Request):
     # off that are another title that shares the name, a special or an excerpt.
     check = settings.runtime_check and settings.tmdb_token and t in ("tvsearch", "movie") \
         and want_season != 0 and any(params.get(k) for k in ("tmdbid", "imdbid", "tvdbid"))
-    # Opt-in: measure every shown file, not only names that lack a resolution
-    # or a language marker. Shares the runtime check's budget.
-    measure_all = settings.measured_metadata
+    # Opt-ins that measure every shown file, not only names that lack a
+    # resolution or a language marker. They share the runtime check's budget.
+    measure_all = settings.measured_metadata or settings.quality_heuristics
     # With all of these off, nothing below asks TMDB or probes more than the
     # labels need.
     if not check and not measure_all:
@@ -1007,7 +1096,8 @@ async def torznab_api(request: Request):
     return _render_feed(request, shown, category, heights=heights, audio=audio,
                         query=display, season=(season if t == "tvsearch" else None), ep=ep,
                         episodes=episodes, language=language, czech_titles=czech_titles,
-                        infos=infos, metadata=settings.measured_metadata)
+                        infos=infos, metadata=settings.measured_metadata,
+                        heuristics=settings.quality_heuristics)
 
 
 @router.get("/torznab/nzb/{ident}")

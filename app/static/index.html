@@ -899,11 +899,19 @@
           audio-track language</b> to the language attribute. Track tags are
           metadata, not a verified dub. Off by default; measuring shares the
           30&nbsp;s search budget, unmeasured files go out unchanged.</p>
+        <p class="shint">Separately, <b>quality heuristics</b> infer from the
+          measurement: a resolution the name overstates (a "4K" with 1080p inside)
+          is corrected, and a file is marked <b>Upscaled</b> when its name says it
+          is an AI upscale or a 2160p H.264/H.265 runs below a real UHD bitrate.
+          These can misjudge a file, so they are off by default.</p>
       </div>
       <div class="sform">
         <label class="scheck"><input id="set-measured-metadata" type="checkbox">
           Add measured codecs and track languages</label>
         <span class="sresult" id="set-measured-result"></span>
+        <label class="scheck"><input id="set-quality-heuristics" type="checkbox">
+          Correct overstated resolutions and mark upscales</label>
+        <span class="sresult" id="set-heuristics-result"></span>
       </div>
     </div>
 
@@ -1176,6 +1184,7 @@ const App = {
         ? "•••••••• (set — leave empty to keep)" : "TMDB Read Access Token";
       $("set-runtime-check").checked = !!s.runtime_check;
       $("set-measured-metadata").checked = !!s.measured_metadata;
+      $("set-quality-heuristics").checked = !!s.quality_heuristics;
       this.renderAliases(s.aliases || []);
     } catch (e) { /* offline banner already covers this */ }
   },
@@ -1818,6 +1827,17 @@ $("set-measured-metadata").onchange = async (e) => {
   } catch (err) {
     e.target.checked = !on;
     sresult("set-measured-result", false, err.message);
+  }
+};
+
+$("set-quality-heuristics").onchange = async (e) => {
+  const on = e.target.checked;
+  try {
+    await uiPost("settings", { quality_heuristics: on });
+    sresult("set-heuristics-result", true, on ? "✓ Quality heuristics on" : "✓ Quality heuristics off");
+  } catch (err) {
+    e.target.checked = !on;
+    sresult("set-heuristics-result", false, err.message);
   }
 };
 

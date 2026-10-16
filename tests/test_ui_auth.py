@@ -207,6 +207,48 @@ def test_measured_metadata_env_default(monkeypatch, tmp_path):
     assert fresh.measured_metadata is True
 
 
+def test_quality_heuristics_setting_defaults_off_validates_and_persists(client, monkeypatch):
+    import json
+
+    from app.config import config
+    from app.settings import settings
+
+    _setup(client)
+    assert client.get("/ui/api/settings").json()["quality_heuristics"] is False
+    assert 'id="set-quality-heuristics"' in client.get("/ui").text
+
+    assert client.post("/ui/api/settings", json={"quality_heuristics": True}).status_code == 200
+    assert client.get("/ui/api/settings").json()["quality_heuristics"] is True
+    assert json.loads(config.settings_file.read_text())["quality_heuristics"] is True
+    # independent of the measured metadata
+    assert client.get("/ui/api/settings").json()["measured_metadata"] is False
+
+    rejected = client.post("/ui/api/settings", json={"quality_heuristics": 1})
+    assert rejected.status_code == 400
+    assert settings.quality_heuristics is True
+
+    client.post("/ui/api/settings", json={"quality_heuristics": False})
+    monkeypatch.setattr(config, "quality_heuristics", True)
+    settings.load()
+    assert settings.quality_heuristics is False
+
+
+def test_quality_heuristics_env_default(monkeypatch, tmp_path):
+    from app.config import Config, config
+    from app.settings import Settings
+
+    monkeypatch.delenv("QUALITY_HEURISTICS", raising=False)
+    assert Config().quality_heuristics is False
+    monkeypatch.setenv("QUALITY_HEURISTICS", "true")
+    assert Config().quality_heuristics is True
+
+    monkeypatch.setattr(config, "settings_file", tmp_path / "settings.json")
+    monkeypatch.setattr(config, "quality_heuristics", True)
+    fresh = Settings()
+    fresh.load()
+    assert fresh.quality_heuristics is True
+
+
 def test_webshare_password_never_stored_in_plaintext(client):
     from app.config import config
     import json
