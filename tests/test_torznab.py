@@ -1386,3 +1386,60 @@ def test_quality_heuristics_in_the_feed(client, fake_webshare, monkeypatch):
     # as without the option; the heuristics then drop the false "4K")
     assert titles == {"fake4k": "Film 2020 CZ 1080p", "ai": "Film 2020 1080p AI WEB CZ Upscaled",
                       "broken": "Film 2020 4K EN"}
+
+
+# --- stub filter (opt-in) ----------------------------------------------------
+
+def test_is_stub():
+    from app.torznab import is_stub
+    assert is_stub(10 * 1024 ** 2, 135 * 60)            # 10 MiB over 135 min
+    assert not is_stub(1 * _GB, 100 * 60)               # 10 MiB/min: a poor encode, not a stub
+    assert not is_stub(10 * 1024 ** 2, 0)               # unknown length
+    assert not is_stub(0, 6000)                         # unknown size
+
+
+def test_stubs_are_kept_by_default(client, fake_webshare, monkeypatch):
+    """Off (the default) a stub goes out like any other file, and a named file
+    isn't probed for it."""
+    from app.settings import settings
+    assert settings.reject_stubs is False
+    monkeypatch.setattr(settings, "aliases", [])
+    monkeypatch.setattr(settings, "tmdb_token", "")
+    probed = _counting_file_info(fake_webshare)
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [SearchResult("stub", "Hleda se Nemo 2003 1080p CZ.mp4", 10 * 1024 ** 2)]
+    fake_webshare.file_infos = {"stub": _info(length=8000)}
+    assert list(_items(client, t="movie", q="Hleda se Nemo")) == ["stub"]
+    assert probed == []
+
+
+def test_reject_stubs_drops_and_replaces_them(client, fake_webshare, monkeypatch):
+    """On, a stub is dropped and replaced from the next page; unknown length and
+    a failed probe keep the file (fail open)."""
+    import httpx
+    from app.settings import settings
+    monkeypatch.setattr(settings, "aliases", [])
+    monkeypatch.setattr(settings, "tmdb_token", "")
+    monkeypatch.setattr(settings, "reject_stubs", True)
+    real = fake_webshare.file_info
+
+    async def file_info(ident):
+        if ident == "broken":
+            raise httpx.ConnectError("webshare down")
+        return await real(ident)
+
+    fake_webshare.file_info = file_info
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [  # page 1 (limit 3): the first three; page 2: "good"
+        SearchResult("broken", "Hleda se Nemo 2003 720p CZ.mkv", 8 * _GB),
+        SearchResult("unknown", "Hleda se Nemo 2003 CZ.avi", 7 * _GB),
+        SearchResult("stub", "Hleda se Nemo 2003 1080p CZ.mp4", 10 * 1024 ** 2),
+        SearchResult("good", "Hleda se Nemo 2003 2160p CZ.mkv", 6 * _GB),
+    ]
+    fake_webshare.file_infos = {"stub": _info(length=8000), "unknown": _info(length=0),
+                                "good": _info(width=3840, height=2160)}
+    got = _items(client, t="movie", q="Hleda se Nemo", limit="3")
+    assert sorted(got) == ["broken", "good", "unknown"]
+    assert [o for _q, _l, o in fake_webshare.searches] == [0, 3]   # one refill page
+    # nothing else changes with only the stub filter on
+    assert got["good"] == ("Hleda se Nemo 2003 2160p CZ", ["Czech"])

@@ -424,7 +424,7 @@ def runtime_mismatch(length_s: int, minutes: int, kind: str, *,
 # as on a probe error).
 _RUNTIME_BUDGET = 30.0
 # Extra Webshare result pages fetched per query to replace files the runtime
-# check dropped, at most.
+# check or the stub filter dropped, at most.
 _RUNTIME_EXTRA_PAGES = 2
 
 
@@ -794,6 +794,17 @@ def _mib_per_min(size: int, length_s: int) -> float:
     return size / 1048576 / (length_s / 60) if size and length_s else 0.0
 
 
+# Stub rejection (opt-in, settings.reject_stubs): below this many MiB per minute
+# a file is a stub or a broken upload, not a watchable encode (10 MB over 135
+# minutes). Unknown size or length is never a stub.
+_STUB_MIB_PER_MIN = 3
+
+
+def is_stub(size: int, length_s: int) -> bool:
+    """A few MiB per minute: a stub/broken upload, not a watchable encode."""
+    return 0 < _mib_per_min(size, length_s) < _STUB_MIB_PER_MIN
+
+
 def quality_heuristics(name: str, size: int, info: dict) -> tuple[str, list[str]]:
     """(name with an overstated resolution corrected, extra tokens).
 
@@ -1039,7 +1050,7 @@ async def torznab_api(request: Request):
         and want_season != 0 and any(params.get(k) for k in ("tmdbid", "imdbid", "tvdbid"))
     # Opt-ins that measure every shown file, not only names that lack a
     # resolution or a language marker. They share the runtime check's budget.
-    measure_all = settings.measured_metadata or settings.quality_heuristics
+    measure_all = settings.measured_metadata or settings.quality_heuristics or settings.reject_stubs
     # With all of these off, nothing below asks TMDB or probes more than the
     # labels need.
     if not check and not measure_all:
@@ -1085,6 +1096,8 @@ async def torznab_api(request: Request):
             length = int(info.get("length") or 0)
             if runtime_mismatch(length, minutes, kind, name=r.name, exact=exact):
                 return f"{length // 60} min, expected ~{minutes} min"
+            if settings.reject_stubs and is_stub(r.size, length):
+                return f"a stub, {_mib_per_min(r.size, length):.1f} MiB/min"
             return ""
 
         if minutes or measure_all:

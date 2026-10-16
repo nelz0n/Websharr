@@ -184,6 +184,7 @@ async def ui_settings_get(request: Request):
         "runtime_check": settings.runtime_check,
         "measured_metadata": settings.measured_metadata,
         "quality_heuristics": settings.quality_heuristics,
+        "reject_stubs": settings.reject_stubs,
         "max_concurrent": request.app.state.downloads.max_concurrent,
         "notify_urls": settings.notify_urls,
         "notify_vip_days": settings.notify_vip_days,
@@ -271,6 +272,11 @@ async def ui_settings_post(request: Request):
         if not isinstance(body.get("quality_heuristics"), bool):
             return JSONResponse({"error": "quality_heuristics must be true or false"}, status_code=400)
         settings.quality_heuristics = body["quality_heuristics"]
+
+    if "reject_stubs" in body:
+        if not isinstance(body.get("reject_stubs"), bool):
+            return JSONResponse({"error": "reject_stubs must be true or false"}, status_code=400)
+        settings.reject_stubs = body["reject_stubs"]
 
     if "max_concurrent" in body:
         try:

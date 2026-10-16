@@ -27,6 +27,9 @@ class Config:
         # mark upscales (opt-in, off by default); the UI value wins.
         self.quality_heuristics = os.environ.get("QUALITY_HEURISTICS", "").strip().lower() in (
             "1", "true", "yes", "on")
+        # Drop files measured under 3 MiB per minute (stubs; opt-in, off by
+        # default); the UI value wins.
+        self.reject_stubs = os.environ.get("REJECT_STUBS", "").strip().lower() in ("1", "true", "yes", "on")
         # Apprise notification URLs (comma/newline separated) and the VIP-expiry
         # warning threshold in days; UI values override these.
         self.notify_urls = [u.strip() for u in re.split(r"[,\n]", os.environ.get("NOTIFY_URLS", "")) if u.strip()]

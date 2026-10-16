@@ -71,6 +71,10 @@ class Settings:
         # upscales. Inferences, not measurements, so off unless enabled (env var
         # QUALITY_HEURISTICS, the UI toggle overrides it).
         self.quality_heuristics: bool = config.quality_heuristics
+        # Stub rejection: drop files measured under 3 MiB per minute. A hard
+        # filter, so off unless enabled (env var REJECT_STUBS, the UI toggle
+        # overrides it).
+        self.reject_stubs: bool = config.reject_stubs
         # Concurrent-download limit; env var is the initial default, editable in
         # the UI (Settings and the Queue page).
         self.max_concurrent: int = config.max_concurrent
@@ -112,6 +116,8 @@ class Settings:
         self.measured_metadata = metadata if isinstance(metadata, bool) else config.measured_metadata
         heuristics = data.get("quality_heuristics")
         self.quality_heuristics = heuristics if isinstance(heuristics, bool) else config.quality_heuristics
+        stubs = data.get("reject_stubs")
+        self.reject_stubs = stubs if isinstance(stubs, bool) else config.reject_stubs
         try:
             self.max_concurrent = max(1, int(data.get("max_concurrent") or config.max_concurrent))
         except (TypeError, ValueError):
@@ -142,6 +148,7 @@ class Settings:
             "runtime_check": self.runtime_check,
             "measured_metadata": self.measured_metadata,
             "quality_heuristics": self.quality_heuristics,
+            "reject_stubs": self.reject_stubs,
             "max_concurrent": self.max_concurrent,
             "notify_urls": self.notify_urls,
             "notify_vip_days": self.notify_vip_days,

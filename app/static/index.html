@@ -904,6 +904,10 @@
           is corrected, and a file is marked <b>Upscaled</b> when its name says it
           is an AI upscale or a 2160p H.264/H.265 runs below a real UHD bitrate.
           These can misjudge a file, so they are off by default.</p>
+        <p class="shint">Also optional: <b>drop stubs</b>, files measured under
+          3&nbsp;MiB per minute (a few MB for a whole film). A hard filter, off by
+          default; files of unknown length are never dropped, and dropped ones are
+          replaced from the next result pages.</p>
       </div>
       <div class="sform">
         <label class="scheck"><input id="set-measured-metadata" type="checkbox">
@@ -912,6 +916,9 @@
         <label class="scheck"><input id="set-quality-heuristics" type="checkbox">
           Correct overstated resolutions and mark upscales</label>
         <span class="sresult" id="set-heuristics-result"></span>
+        <label class="scheck"><input id="set-reject-stubs" type="checkbox">
+          Drop stubs under 3 MiB per minute</label>
+        <span class="sresult" id="set-stubs-result"></span>
       </div>
     </div>
 
@@ -1185,6 +1192,7 @@ const App = {
       $("set-runtime-check").checked = !!s.runtime_check;
       $("set-measured-metadata").checked = !!s.measured_metadata;
       $("set-quality-heuristics").checked = !!s.quality_heuristics;
+      $("set-reject-stubs").checked = !!s.reject_stubs;
       this.renderAliases(s.aliases || []);
     } catch (e) { /* offline banner already covers this */ }
   },
@@ -1838,6 +1846,17 @@ $("set-quality-heuristics").onchange = async (e) => {
   } catch (err) {
     e.target.checked = !on;
     sresult("set-heuristics-result", false, err.message);
+  }
+};
+
+$("set-reject-stubs").onchange = async (e) => {
+  const on = e.target.checked;
+  try {
+    await uiPost("settings", { reject_stubs: on });
+    sresult("set-stubs-result", true, on ? "✓ Stubs dropped" : "✓ Stubs kept");
+  } catch (err) {
+    e.target.checked = !on;
+    sresult("set-stubs-result", false, err.message);
   }
 };
 

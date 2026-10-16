@@ -197,6 +197,15 @@ metadata they measure every shown file within the same budget:
   alone can't prove an upscale, which is why this is opt-in; AV1/VP9 files are
   never judged by bitrate.
 
+### Stub filter (optional, off by default)
+
+**Settings → Measured metadata → Drop stubs under 3 MiB per minute**, or
+`REJECT_STUBS=true` (the UI value wins), drops files measured below 3 MiB per
+minute — a few MB for a whole film is a stub or a broken upload, not an encode.
+It measures every shown file within the same budget; files of unknown length,
+not measured in time or whose probe fails are kept, and dropped files are
+replaced from up to two further Webshare result pages, as with the runtime check.
+
 ## Monitoring and notifications
 
 - **Dashboard widget.** `GET /stats?apikey=…` returns compact JSON (active/queued
@@ -220,6 +229,7 @@ metadata they measure every shown file within the same budget:
 | `RUNTIME_CHECK` | `false` | `true` drops files far off the TMDB runtime ([runtime check](#runtime-check-optional-off-by-default); UI value wins) |
 | `MEASURED_METADATA` | `false` | `true` probes every shown file and adds the reported codecs and track languages ([measured metadata](#measured-metadata-optional-off-by-default); UI value wins) |
 | `QUALITY_HEURISTICS` | `false` | `true` corrects overstated resolutions and marks upscales ([quality heuristics](#quality-heuristics-optional-off-by-default); UI value wins) |
+| `REJECT_STUBS` | `false` | `true` drops files measured under 3 MiB per minute ([stub filter](#stub-filter-optional-off-by-default); UI value wins) |
 | `NOTIFY_URLS` | — | Apprise URLs (comma-separated) for failure/VIP notifications (UI value wins) |
 | `NOTIFY_VIP_DAYS` | `7` | Warn when Webshare VIP has this many days left or fewer |
 | `SETTINGS_FILE` | `/config/settings.json` | persisted settings (UI account, Webshare login, API key) |
