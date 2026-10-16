@@ -187,6 +187,14 @@ def test_search_cache_ttl_zero_does_not_coalesce(monkeypatch):
     assert started == ["/search/", "/search/"]
 
 
+def test_search_cache_ttl_defaults_to_off(monkeypatch):
+    from app.config import Config
+    monkeypatch.delenv("SEARCH_CACHE_TTL", raising=False)
+    assert Config().search_cache_ttl == 0
+    monkeypatch.setenv("SEARCH_CACHE_TTL", "600")
+    assert Config().search_cache_ttl == 600
+
+
 def test_mutating_a_returned_result_does_not_change_later_hits(monkeypatch):
     client, calls = _counting_client(monkeypatch)
 
