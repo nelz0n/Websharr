@@ -300,27 +300,35 @@ async def _file_info(client, ident: str) -> dict:
     return {}
 
 
-async def _probe(client, results: list[SearchResult], all_files: bool = False
-                 ) -> tuple[dict[str, int], dict[str, str], dict[str, int]]:
+async def _probe(client, results: list[SearchResult], all_files: bool = False,
+                 timeout: float | None = None
+                 ) -> tuple[dict[str, int], dict[str, str], dict[str, int], set[str]]:
     """Fetch file_info for results whose *name* leaves something open, and
-    return (heights, audio, lengths): the video height for names without a
-    resolution token — many CZ files ship without one and Sonarr/Radarr reject
-    them as 'Unknown' quality otherwise — "Czech"/"Slovak" for names without a
-    language marker whose audio track says so (a TV-rip dub named just
+    return (heights, audio, lengths, unfinished): the video height for names
+    without a resolution token — many CZ files ship without one and Sonarr/Radarr
+    reject them as 'Unknown' quality otherwise — "Czech"/"Slovak" for names
+    without a language marker whose audio track says so (a TV-rip dub named just
     "... 1080p WEB-DL prima+"), and the duration in seconds of every probed file.
-    `all_files` probes every result (for the runtime check), not just those."""
+    `all_files` probes every result (for the runtime check), not just those.
+    With a `timeout`, probes still running after it are abandoned and their
+    idents returned in `unfinished` (fail open: those files go out unmeasured)."""
     need = results if all_files else \
         [r for r in results if not _RES_RE.search(r.name) or not dub_language(r.name)]
     if not need:
-        return {}, {}, {}
+        return {}, {}, {}, set()
 
-    async def one(r: SearchResult):
-        return r, await _file_info(client, r.ident)
+    tasks = {asyncio.ensure_future(_file_info(client, r.ident)): r for r in need}
+    _done, pending = await asyncio.wait(tasks, timeout=timeout)
+    for task in pending:
+        task.cancel()
 
     heights: dict[str, int] = {}
     audio: dict[str, str] = {}
     lengths: dict[str, int] = {}
-    for r, info in await asyncio.gather(*(one(r) for r in need)):
+    for task, r in tasks.items():
+        if task in pending:
+            continue
+        info = task.result()
         if int(info.get("length") or 0) > 0:
             lengths[r.ident] = int(info["length"])
         height = resolution_class(int(info.get("width") or 0), int(info.get("height") or 0))
@@ -329,24 +337,107 @@ async def _probe(client, results: list[SearchResult], all_files: bool = False
         lang = audio_language(info.get("audio_languages"))
         if lang and not dub_language(r.name):
             audio[r.ident] = lang
-    return heights, audio, lengths
+    return heights, audio, lengths, {tasks[t].ident for t in pending}
 
 
-# How far a file's duration may stray from the TMDB runtime, as (min, max)
-# fractions. Movies allow extended cuts; episodes allow double episodes.
-_RUNTIME_BOUNDS = {"movie": (0.6, 1.6), "tv": (0.5, 2.6)}
+# Runtime check (opt-in, settings.runtime_check). How far a file's duration may
+# stray from the TMDB runtime, as (min, max) fractions: movies allow longer cuts,
+# episodes double episodes. Only a mismatch is acted on — a file of the right
+# length is never taken as proof that it is the right title.
+_RUNTIME_BOUNDS = {"movie": (0.6, 2.0), "tv": (0.5, 2.6)}
+# A show-level typical episode length (season search, or no runtime for the
+# episode itself) is a weak reference: episodes of one show can run several
+# times longer, so it only rejects files far *shorter* than it.
+_RUNTIME_FALLBACK_MIN = 0.35
+# Named editions run longer than the TMDB runtime by any amount; multi-episode
+# files are several episodes long. Neither is rejected for being too long.
+_EDITION_RE = re.compile(
+    r"\b(?:extended|uncut|unrated|redux|directors? cut|director s cut|final cut"
+    r"|(?:special|ultimate|collectors?) edition|prodlouzena verze|rezisersky sestrih)\b")
+_MULTI_EP_RE = re.compile(r"\bs\d{1,2}e\d{1,3}(?:-?e\d{1,3}|-\d{1,3})+\b", re.I)
 
 
-def runtime_mismatch(length_s: int, minutes: int, kind: str) -> bool:
+def runtime_mismatch(length_s: int, minutes: int, kind: str, *,
+                     name: str = "", exact: bool = True) -> bool:
     """True when a file of `length_s` seconds can't be the title TMDB says runs
     `minutes` — a 7-minute Bluey episode vs an hour of "Blue Planet", a feature
-    vs a short special, a full episode vs a 5-minute excerpt. Unknown on either
-    side is never a mismatch."""
+    vs a short special, a full episode vs a 5-minute excerpt. `exact` is False
+    for a show-level fallback runtime (see _RUNTIME_FALLBACK_MIN); `name` lifts
+    the upper bound for a named edition or a multi-episode file. Unknown on
+    either side is never a mismatch."""
     if not length_s or not minutes or kind not in _RUNTIME_BOUNDS:
         return False
     lo, hi = _RUNTIME_BOUNDS[kind]
+    if not exact:
+        lo, hi = _RUNTIME_FALLBACK_MIN, None
+    if _EDITION_RE.search(normalize_text(name)) or (kind == "tv" and _MULTI_EP_RE.search(name)):
+        hi = None
     ratio = length_s / 60 / minutes
-    return ratio < lo or ratio > hi
+    return ratio < lo or (hi is not None and ratio > hi)
+
+
+# Time a search may spend on the runtime check (TMDB runtime, probes and refill
+# pages) before it answers with what it has: Sonarr gives an indexer 100 s and
+# then ignores it for minutes. Whatever isn't measured by then goes out
+# unmeasured (fail open, as on a probe error).
+_RUNTIME_BUDGET = 30.0
+# Extra Webshare result pages fetched per query to replace files the runtime
+# check dropped, at most.
+_RUNTIME_EXTRA_PAGES = 2
+
+
+async def _runtime_filtered(client, merged: list[SearchResult], limit: int, kind: str,
+                            minutes: int, exact: bool, more, deadline: float
+                            ) -> tuple[list[SearchResult], dict[str, int], dict[str, str]]:
+    """The first `limit` of `merged` whose duration doesn't contradict the TMDB
+    runtime, plus (heights, audio) of the probed ones.
+
+    Files are measured in order, only as many as are needed to fill the limit;
+    when dropped files leave it short, `more()` fetches the next Webshare page
+    ([] once there are no more, or the page cap is reached). At `deadline` (loop
+    time) the remaining candidates go out unmeasured instead of being dropped."""
+    loop = asyncio.get_running_loop()
+    merged = list(merged)
+    rejected: set[str] = set()
+    measured: set[str] = set()
+    heights: dict[str, int] = {}
+    audio: dict[str, str] = {}
+    while True:
+        candidates = [r for r in merged if r.ident not in rejected][:limit]
+        todo = [r for r in candidates if r.ident not in measured]
+        if not todo and len(candidates) >= limit:
+            break
+        left = deadline - loop.time()
+        if left <= 0:
+            logger.info("Runtime check budget of %ds spent: remaining files go out unmeasured",
+                        _RUNTIME_BUDGET)
+            break
+        if not todo:
+            try:
+                new = await asyncio.wait_for(more(), timeout=left)
+            except asyncio.TimeoutError:
+                logger.info("Runtime check budget of %ds spent while refilling", _RUNTIME_BUDGET)
+                break
+            if not new:
+                break
+            merged.extend(new)
+            continue
+        h, a, lengths, unfinished = await _probe(client, todo, all_files=True, timeout=left)
+        heights.update(h)
+        audio.update(a)
+        for r in todo:
+            if r.ident in unfinished:
+                continue
+            measured.add(r.ident)
+            if runtime_mismatch(lengths.get(r.ident, 0), minutes, kind, name=r.name, exact=exact):
+                logger.info("Dropped %r: %d min, expected ~%d min",
+                            r.name, lengths[r.ident] // 60, minutes)
+                rejected.add(r.ident)
+        if unfinished:
+            logger.info("Runtime check budget of %ds spent: %d files go out unmeasured",
+                        _RUNTIME_BUDGET, len(unfinished))
+            break
+    return [r for r in merged if r.ident not in rejected][:limit], heights, audio
 
 
 _EP_TOKEN = re.compile(r"^(s\d{1,2}e\d{1,3}|s\d{1,2}|\d{1,2}x\d{1,3}|\d{1,4})$")
@@ -683,12 +774,10 @@ async def torznab_api(request: Request):
     seen: set[str] = set()
     merged: list[SearchResult] = []
     episodes: dict[str, int] = {}  # season search: each file's own episode number
-    for query in queries:
-        try:
-            results = await client.search(query, limit=limit, offset=offset)
-        except (WebshareError, httpx.HTTPError) as exc:
-            logger.error("Search '%s' failed: %s", query, exc)
-            return _error(900, f"Webshare search failed: {exc}")
+
+    def accept(results: list[SearchResult]) -> list[SearchResult]:
+        """The results that are files of the requested title (and episode)."""
+        kept = []
         for r in results:
             if r.ident in seen or r.password or not _is_video(r.name):
                 continue
@@ -711,33 +800,73 @@ async def torznab_api(request: Request):
                         continue
                     episodes[r.ident] = fe
             seen.add(r.ident)
-            merged.append(r)
-
-    merged.sort(key=lambda r: (-relevance(queries, r.name), -r.size))
-    logger.info("Newznab %s q=%r -> %d results", t, q, len(merged))
-    # With an exact id, TMDB knows how long the title runs; files far off that
-    # are another title that shares the name, a special or an excerpt.
-    minutes = 0
-    kind = "tv" if t == "tvsearch" else "movie"
-    if settings.tmdb_token and t in ("tvsearch", "movie") and (
-            params.get("tmdbid") or params.get("imdbid") or params.get("tvdbid")):
-        minutes = await tmdb_runtime(settings.tmdb_token, kind, params.get("tmdbid"),
-                                     params.get("imdbid"), params.get("tvdbid"),
-                                     season if t == "tvsearch" else None,
-                                     ep if t == "tvsearch" else None)
-    # Check a few more than asked for, so dropped files don't leave *arr with
-    # fewer results than the limit when more good ones exist.
-    shown = merged[:limit * 2] if minutes else merged[:limit]
-    heights, audio, lengths = await _probe(client, shown, all_files=bool(minutes))
-    if minutes:
-        kept = []
-        for r in shown:
-            if runtime_mismatch(lengths.get(r.ident, 0), minutes, kind):
-                logger.info("Dropped %r: %d min, expected ~%d min",
-                            r.name, lengths[r.ident] // 60, minutes)
-                continue
             kept.append(r)
-        shown = kept[:limit]
+        return kept
+
+    full: list[str] = []  # queries whose page came back full: more may follow
+    for query in queries:
+        try:
+            results = await client.search(query, limit=limit, offset=offset)
+        except (WebshareError, httpx.HTTPError) as exc:
+            logger.error("Search '%s' failed: %s", query, exc)
+            return _error(900, f"Webshare search failed: {exc}")
+        if len(results) >= limit:
+            full.append(query)
+        merged.extend(accept(results))
+
+    def rank(results: list[SearchResult]) -> None:
+        results.sort(key=lambda r: (-relevance(queries, r.name), -r.size))
+
+    rank(merged)
+    logger.info("Newznab %s q=%r -> %d results", t, q, len(merged))
+    # Opt-in: with an exact id, TMDB knows how long the title runs; files far
+    # off that are another title that shares the name, a special or an excerpt.
+    # Off, nothing below asks TMDB or probes more than the labels need.
+    check = settings.runtime_check and settings.tmdb_token and t in ("tvsearch", "movie") \
+        and want_season != 0 and any(params.get(k) for k in ("tmdbid", "imdbid", "tvdbid"))
+    if not check:
+        shown = merged[:limit]
+        heights, audio, _lengths, _unfinished = await _probe(client, shown)
+    else:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _RUNTIME_BUDGET
+        kind = "tv" if t == "tvsearch" else "movie"
+        try:
+            minutes, exact = await asyncio.wait_for(tmdb_runtime(
+                settings.tmdb_token, kind, params.get("tmdbid"), params.get("imdbid"),
+                params.get("tvdbid"), season if t == "tvsearch" else None,
+                ep if t == "tvsearch" else None), timeout=_RUNTIME_BUDGET)
+        except asyncio.TimeoutError:
+            logger.info("TMDB runtime lookup outlived the budget: no runtime check")
+            minutes, exact = 0, False
+        pages = 0
+
+        async def more() -> list[SearchResult]:
+            """The next result page of every query that still had a full one."""
+            nonlocal full, pages
+            new: list[SearchResult] = []
+            while not new and full and pages < _RUNTIME_EXTRA_PAGES:
+                pages += 1
+                still_full = []
+                for query in full:
+                    try:
+                        results = await client.search(query, limit=limit, offset=offset + pages * limit)
+                    except (WebshareError, httpx.HTTPError) as exc:
+                        logger.warning("Refill search '%s' failed: %s", query, exc)
+                        continue
+                    if len(results) >= limit:
+                        still_full.append(query)
+                    new.extend(accept(results))
+                full = still_full
+            rank(new)
+            return new
+
+        if minutes:
+            shown, heights, audio = await _runtime_filtered(
+                client, merged, limit, kind, minutes, exact, more, deadline)
+        else:
+            shown = merged[:limit]  # runtime unknown: label probes only, as with the check off
+            heights, audio, _lengths, _unfinished = await _probe(client, shown)
     return _render_feed(request, shown, category, heights=heights, audio=audio,
                         query=display, season=(season if t == "tvsearch" else None), ep=ep,
                         episodes=episodes, language=language, czech_titles=czech_titles)
