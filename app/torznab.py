@@ -259,12 +259,14 @@ def resolution_class(width: int, height: int) -> int:
 # per-request limit wasn't enough: the 403s were swallowed and the files lost
 # their resolution label, audio language and runtime check. One process-wide
 # limit, a short retry on 403/429/5xx, and a cache (a Webshare file never
-# changes under its ident) keep the probe reliable.
+# changes under its ident) keep the probe reliable. Parallel searches often
+# share files, so concurrent misses for one ident share one request.
 _PROBE_CONCURRENCY = 4
 _PROBE_RETRIES = (0.5, 1.5, 3.0)
 _PROBE_CACHE_MAX = 5000
 _probe_sem: asyncio.Semaphore | None = None
 _probe_cache: dict[str, dict] = {}
+_probe_inflight: dict[str, asyncio.Future] = {}
 
 
 def _semaphore() -> asyncio.Semaphore:
@@ -275,9 +277,29 @@ def _semaphore() -> asyncio.Semaphore:
 
 
 async def _file_info(client, ident: str) -> dict:
-    """file_info with a process-wide concurrency limit, retry and cache; {} on failure."""
+    """file_info with a process-wide concurrency limit, retry and cache; {} on
+    failure. Concurrent calls for one ident wait for a single request.
+
+    A caller that stops waiting (its search budget spent) doesn't cancel that
+    request: it finishes for the others waiting on it and fills the cache."""
     if ident in _probe_cache:
         return _probe_cache[ident]
+    task = _probe_inflight.get(ident)
+    if task is None:
+        task = asyncio.ensure_future(_fetch_file_info(client, ident))
+        _probe_inflight[ident] = task
+        task.add_done_callback(lambda done: _probe_finished(ident, done))
+    return await asyncio.shield(task)
+
+
+def _probe_finished(ident: str, task: asyncio.Future) -> None:
+    if _probe_inflight.get(ident) is task:
+        del _probe_inflight[ident]
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning("file_info %s failed: %r", ident, task.exception())
+
+
+async def _fetch_file_info(client, ident: str) -> dict:
     for delay in (*_PROBE_RETRIES, None):
         try:
             async with _semaphore():
@@ -310,8 +332,9 @@ async def _probe(client, results: list[SearchResult], all_files: bool = False,
     without a language marker whose audio track says so (a TV-rip dub named just
     "... 1080p WEB-DL prima+"), and the duration in seconds of every probed file.
     `all_files` probes every result (for the runtime check), not just those.
-    With a `timeout`, probes still running after it are abandoned and their
-    idents returned in `unfinished` (fail open: those files go out unmeasured)."""
+    With a `timeout`, probes still running after it are no longer waited for
+    and their idents returned in `unfinished` (fail open: those files go out
+    unmeasured; the probes finish in the background and fill the cache)."""
     need = results if all_files else \
         [r for r in results if not _RES_RE.search(r.name) or not dub_language(r.name)]
     if not need:
@@ -328,7 +351,8 @@ async def _probe(client, results: list[SearchResult], all_files: bool = False,
     for task, r in tasks.items():
         if task in pending:
             continue
-        info = task.result()
+        # a probe that raised is unmeasured, like one that returned nothing
+        info = {} if task.cancelled() or task.exception() is not None else task.result() or {}
         if int(info.get("length") or 0) > 0:
             lengths[r.ident] = int(info["length"])
         height = resolution_class(int(info.get("width") or 0), int(info.get("height") or 0))

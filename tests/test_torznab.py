@@ -605,6 +605,87 @@ def test_file_info_fails_open_after_retries():
     assert c404.calls == 1                                 # not retryable
 
 
+class _GatedClient:
+    """file_info that waits for `gate` and counts the requests that reach it."""
+
+    def __init__(self, gate, fail=None):
+        self.calls = 0
+        self.gate = gate
+        self.fail = fail
+
+    async def file_info(self, ident):
+        self.calls += 1
+        await self.gate.wait()
+        if self.fail:
+            raise self.fail
+        return {"length": 5400, "width": 1920, "height": 1080}
+
+
+def test_concurrent_probes_of_one_file_share_one_request():
+    """Parallel searches sharing a file (cold cache) send one file_info for it,
+    not one each."""
+    import asyncio
+    from app import torznab
+
+    async def run():
+        gate = asyncio.Event()
+        c = _GatedClient(gate)
+        waiters = [asyncio.ensure_future(torznab._file_info(c, "same")) for _ in range(5)]
+        other = asyncio.ensure_future(torznab._file_info(c, "other"))
+        await asyncio.sleep(0.01)
+        gate.set()
+        infos = await asyncio.gather(*waiters, other)
+        return c.calls, infos
+
+    calls, infos = asyncio.run(run())
+    assert calls == 2                                      # one per ident
+    assert all(i["height"] == 1080 for i in infos)
+    assert torznab._probe_inflight == {} and set(torznab._probe_cache) == {"same", "other"}
+
+
+def test_probe_abandoned_by_one_search_still_serves_the_others():
+    """A search whose budget runs out stops waiting, but the shared request is
+    not cancelled: another search waiting on it gets the answer, and it lands
+    in the cache."""
+    import asyncio
+    from app import torznab
+
+    async def run():
+        gate = asyncio.Event()
+        c = _GatedClient(gate)
+        late = asyncio.ensure_future(torznab._file_info(c, "x"))
+        try:
+            await asyncio.wait_for(torznab._file_info(c, "x"), timeout=0.01)
+        except asyncio.TimeoutError:
+            pass
+        gate.set()
+        return c.calls, await late
+
+    calls, info = asyncio.run(run())
+    assert calls == 1 and info["height"] == 1080
+    assert torznab._probe_cache["x"]["height"] == 1080
+
+
+def test_shared_probe_failure_fails_open_for_every_waiter():
+    """An upstream error answers {} to every search waiting on the probe; nothing
+    is cached, so the next search asks again."""
+    import asyncio
+    import httpx
+    from app import torznab
+
+    async def run():
+        gate = asyncio.Event()
+        c = _GatedClient(gate, fail=httpx.ConnectError("down"))
+        waiters = [asyncio.ensure_future(torznab._file_info(c, "x")) for _ in range(3)]
+        await asyncio.sleep(0.01)
+        gate.set()
+        return c.calls, await asyncio.gather(*waiters)
+
+    calls, infos = asyncio.run(run())
+    assert calls == 1 and infos == [{}, {}, {}]
+    assert "x" not in torznab._probe_cache and torznab._probe_inflight == {}
+
+
 def test_search_labels_odd_height_with_known_class(client, fake_webshare):
     fake_webshare.results = [SearchResult("q3", "Skvrna 05 - Bestie.avi", 200_000_000)]
     fake_webshare.file_infos = {"q3": {"length": 1700, "width": 640, "height": 384,
@@ -762,6 +843,7 @@ def test_probe_state_is_fresh_in_every_test():
     import asyncio
     from app import torznab
     assert torznab._probe_cache == {} and torznab._probe_sem is None
+    assert torznab._probe_inflight == {}
     assert torznab._PROBE_RETRIES == (0, 0, 0)
     assert asyncio.run(torznab.tmdb_runtime("tok", "movie", tmdbid="1")) == (0, False)
 
