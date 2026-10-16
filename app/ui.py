@@ -73,9 +73,34 @@ def _set_session(resp: JSONResponse) -> None:
                     max_age=SESSION_TTL, httponly=True, samesite="lax")
 
 
-def _refresh_account(request: Request) -> None:
-    """Wake the account monitor (main._account_monitor) after a credential change."""
-    event = getattr(request.app.state, "account_refresh", None)
+def _webshare_credentials() -> tuple[str, str, str]:
+    return (config.webshare_username, config.webshare_password, config.webshare_password_digest)
+
+
+def _apply_settings(request: Request) -> None:
+    """settings.apply() plus handing the Webshare credentials to the client.
+    Only an actual credential change invalidates the account status, so
+    saving unrelated settings keeps /ready as it was."""
+    before = _webshare_credentials()
+    settings.apply()
+    request.app.state.webshare.set_credentials(*_webshare_credentials())
+    if _webshare_credentials() != before:
+        _account_changed(request)
+
+
+def _account_changed(request: Request) -> None:
+    """New Webshare credentials: forget the old account's status and wake the
+    account monitor (main._account_monitor) to check the new one right away.
+
+    The old VIP state must not vouch for the new account (/ready would stay
+    200 even if the new login fails), and bumping account_gen makes the monitor
+    drop a refresh that was still running for the old credentials."""
+    state = request.app.state
+    state.account_gen = getattr(state, "account_gen", 0) + 1
+    state.account = None
+    state.account_ts = 0.0
+    state.account_refresh_ok = None
+    event = getattr(state, "account_refresh", None)
     if event is not None:
         event.set()
 
@@ -143,10 +168,7 @@ async def ui_setup(request: Request):
     # Keep an explicitly configured key; otherwise generate one (shown in Settings).
     settings.api_key = config.api_key if config.api_key != "websharr" else secrets.token_hex(16)
     settings.save()
-    settings.apply()
-    request.app.state.webshare.set_credentials(
-        config.webshare_username, config.webshare_password, config.webshare_password_digest)
-    _refresh_account(request)
+    _apply_settings(request)
     logger.info("Initial setup completed (user=%s)", username)
 
     resp = JSONResponse({"ok": True})
@@ -224,7 +246,6 @@ async def ui_settings_post(request: Request):
     if not _authorized(request):
         return _unauthorized()
     body = await request.json()
-    credentials = (config.webshare_username, config.webshare_password, config.webshare_password_digest)
 
     if "webshare_username" in body:
         ws_user = (body.get("webshare_username") or "").strip()
@@ -284,11 +305,7 @@ async def ui_settings_post(request: Request):
         settings.theme = theme
 
     settings.save()
-    settings.apply()
-    request.app.state.webshare.set_credentials(
-        config.webshare_username, config.webshare_password, config.webshare_password_digest)
-    if (config.webshare_username, config.webshare_password, config.webshare_password_digest) != credentials:
-        _refresh_account(request)
+    _apply_settings(request)
     return {"ok": True, "api_key": config.api_key}
 
 

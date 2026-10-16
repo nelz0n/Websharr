@@ -75,6 +75,9 @@ async def lifespan(app: FastAPI):
     app.state.account = None
     app.state.account_ts = 0.0
     app.state.account_refresh_ok = None  # None until the first refresh attempt ends
+    # Bumped by the UI when the Webshare credentials change (ui._account_changed),
+    # so a refresh still running for the old account can't land on the new one.
+    app.state.account_gen = 0
     # Set by the UI when Webshare credentials change: refresh now instead of
     # leaving /ready "pending" (or failed) until the next hourly round.
     app.state.account_refresh = asyncio.Event()
@@ -99,29 +102,36 @@ async def _account_monitor(app: FastAPI) -> None:
     client: WebshareClient = app.state.webshare
     while True:
         if config.webshare_username:
+            # If the credentials change while this refresh runs, its answer (or
+            # failure) belongs to the old account: drop it. The UI has reset the
+            # state and set account_refresh, so the next round starts right away.
+            gen = app.state.account_gen
             try:
                 status = await client.account_status()
-                app.state.account = status
-                app.state.account_ts = time.time()
-                app.state.account_refresh_ok = True
-                notify.reset_throttle("webshare_down")
-                urls = settings.notify_urls
-                if not status["vip"]:
-                    await notify.send_throttled(
-                        urls, "vip", "Websharr: Webshare VIP expired",
-                        "Webshare VIP has expired — downloads will fail until it is renewed.", DAY)
-                elif status["vip_days"] <= settings.notify_vip_days:
-                    await notify.send_throttled(
-                        urls, "vip", "Websharr: Webshare VIP expiring soon",
-                        f"Webshare VIP expires in {status['vip_days']} day(s) — {status['vip_until']}.", DAY)
-                else:
-                    notify.reset_throttle("vip")  # healthy again → warn afresh next time
+                if app.state.account_gen == gen:
+                    app.state.account = status
+                    app.state.account_ts = time.time()
+                    app.state.account_refresh_ok = True
+                    notify.reset_throttle("webshare_down")
+                    urls = settings.notify_urls
+                    if not status["vip"]:
+                        await notify.send_throttled(
+                            urls, "vip", "Websharr: Webshare VIP expired",
+                            "Webshare VIP has expired — downloads will fail until it is renewed.", DAY)
+                    elif status["vip_days"] <= settings.notify_vip_days:
+                        await notify.send_throttled(
+                            urls, "vip", "Websharr: Webshare VIP expiring soon",
+                            f"Webshare VIP expires in {status['vip_days']} day(s) — {status['vip_until']}.",
+                            DAY)
+                    else:
+                        notify.reset_throttle("vip")  # healthy again → warn afresh next time
             except Exception as exc:  # background loop must survive anything
-                app.state.account_refresh_ok = False
-                logger.warning("Webshare account status refresh failed: %s", exc)
-                await notify.send_throttled(
-                    settings.notify_urls, "webshare_down", "Websharr: Webshare unreachable",
-                    f"Could not reach Webshare: {exc}", 6 * 3600)
+                if app.state.account_gen == gen:
+                    app.state.account_refresh_ok = False
+                    logger.warning("Webshare account status refresh failed: %s", exc)
+                    await notify.send_throttled(
+                        settings.notify_urls, "webshare_down", "Websharr: Webshare unreachable",
+                        f"Could not reach Webshare: {exc}", 6 * 3600)
         try:
             await asyncio.wait_for(app.state.account_refresh.wait(), ACCOUNT_REFRESH)
         except asyncio.TimeoutError:
