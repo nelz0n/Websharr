@@ -103,18 +103,40 @@ class DownloadManager:
         return list(self._categories)
 
     def set_categories(self, categories: list[str]) -> list[str]:
-        """Replace the category list at runtime and create the new folders."""
+        """Replace the category list at runtime. The folders are created first:
+        if that fails (OSError) the previous list stays in place."""
+        self.ensure_category_dirs(categories)
         self._categories = list(categories)
-        self.ensure_dirs()
         return self.categories
+
+    def ensure_category_dirs(self, categories: list[str]) -> None:
+        """Create COMPLETE_DIR and COMPLETE_DIR/<cat> for each category. On
+        failure (e.g. a regular file named like the category) the category
+        folders this call created are removed again and the OSError is raised."""
+        self._complete_dir.mkdir(parents=True, exist_ok=True)
+        created: list[Path] = []
+        try:
+            for category in categories:
+                path = self._complete_dir / category
+                if not path.is_dir():
+                    path.mkdir(exist_ok=True)
+                    created.append(path)
+        except OSError:
+            for path in reversed(created):
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+            raise
 
     def ensure_dirs(self) -> None:
         """Pre-create the category folders so *arr's download-client health
         check ("directory does not exist inside the container") passes before
-        the first download of that category completes."""
+        the first download of that category completes. COMPLETE_DIR itself is
+        created even with no categories configured: get_config reports it as
+        the folder of the implicit "*" category."""
         self._incomplete_dir.mkdir(parents=True, exist_ok=True)
-        for category in self._categories:
-            (self._complete_dir / category).mkdir(parents=True, exist_ok=True)
+        self.ensure_category_dirs(self._categories)
 
     # -- persistence -------------------------------------------------------
 

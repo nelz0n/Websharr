@@ -20,7 +20,10 @@ def parse_categories(value) -> list[str]:
         raise ValueError("Categories must be a list or a comma-separated string")
     cats: list[str] = []
     for raw in value:
-        name = str(raw).strip().lower()
+        # No str() coercion: [5] or [None] is a client error, not a "5" category.
+        if not isinstance(raw, str):
+            raise ValueError("Category names must be strings")
+        name = raw.strip().lower()
         if not name or name == "*":
             continue
         if not CATEGORY_RE.match(name):
