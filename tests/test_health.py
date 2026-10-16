@@ -1,3 +1,4 @@
+import os
 import time
 
 import pytest
@@ -96,6 +97,32 @@ def test_ready_dir_not_writable(healthy, monkeypatch):
     resp = healthy.get("/ready")
     assert resp.status_code == 503
     assert "not writable" in resp.json()["checks"]["storage"]["reason"]
+
+
+def test_ready_checks_search_permission(healthy, monkeypatch):
+    # Grant w but not x: the dir can't be traversed, so nothing can be created.
+    real_access = app_main.os.access
+    monkeypatch.setattr(app_main.os, "access",
+                        lambda path, mode: not (mode & os.X_OK) and real_access(path, mode))
+    resp = healthy.get("/ready")
+    assert resp.status_code == 503
+    assert "not writable" in resp.json()["checks"]["storage"]["reason"]
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0,
+                    reason="root ignores directory permission bits")
+def test_ready_dir_without_search_permission(healthy):
+    """A real 0666 dir: writable on paper, but no file can be created in it."""
+    path = config.incomplete_dir
+    path.chmod(0o666)
+    try:
+        with pytest.raises(PermissionError):
+            (path / "probe").touch()
+        resp = healthy.get("/ready")
+        assert resp.status_code == 503
+        assert resp.json()["checks"]["storage"]["reason"] == "incomplete dir not writable"
+    finally:
+        path.chmod(0o755)
 
 
 def test_ready_dir_missing(healthy, monkeypatch, tmp_path):

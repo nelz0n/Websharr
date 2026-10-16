@@ -151,7 +151,9 @@ def _storage_check() -> dict:
     for label, path in (("complete", config.complete_dir), ("incomplete", config.incomplete_dir)):
         if not path.is_dir():
             return {"status": "error", "reason": f"{label} dir missing"}
-        if not os.access(path, os.W_OK):
+        # Creating files needs search (x) permission on the dir as well as w:
+        # a 0666 dir passes W_OK alone but every open() inside it fails.
+        if not os.access(path, os.W_OK | os.X_OK):
             return {"status": "error", "reason": f"{label} dir not writable"}
     return {"status": "ok"}
 
