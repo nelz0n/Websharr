@@ -259,6 +259,16 @@ def test_empty_category_list_recreates_complete_root(client, tmp_path):
         "mode": "get_cats", "apikey": "testkey", "output": "json"}).json()["categories"] == ["*"]
 
 
+def test_grab_form_offers_configured_categories(client):
+    # The manual grab form lists the SABnzbd categories (get_cats), so a custom
+    # one like tv-kids can be picked instead of only Shows/Movies.
+    client.post("/ui/api/setup", json={"username": "u", "password": "pass1234"})
+    html = client.get("/ui").text
+    assert 'class="g-cat"' in html
+    assert 'sab({ mode: "get_cats" })' in html
+    assert "const cat = catSel.value;" in html
+
+
 def test_ui_search_empty_query(client):
     body = _ui(client, "search", q="", t="search").json()
     assert body["results"] == []
