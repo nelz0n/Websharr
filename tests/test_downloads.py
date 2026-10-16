@@ -1,5 +1,6 @@
 """Download manager: resume after restart (HTTP Range) and retry of failed jobs."""
 
+import dataclasses
 import http.server
 import json
 import threading
@@ -127,19 +128,22 @@ def test_pause_resume(tmp_path, monkeypatch):
         httpd.shutdown()
 
 
-def _seed_interrupted_job(tmp_path, partial: bytes, etag: str = ETAG) -> str:
-    """Write a state file + partial file as if a download was cut off mid-way."""
+def _seed_interrupted_job(tmp_path, partial: bytes, sidecar: str | None = json.dumps({"etag": ETAG})) -> str:
+    """Write a state file + partial file (+ its validator sidecar) as if a
+    download was cut off mid-way."""
     nzo_id = "SABnzbd_nzo_resume01"
     state = {"jobs": [{
         "nzo_id": nzo_id, "ident": "res1", "name": FILE_NAME,
         "category": "movies", "size": len(PAYLOAD), "status": "downloading",
         "downloaded": len(partial), "error": "", "storage": "",
-        "added_ts": 1.0, "completed_ts": 0.0, "etag": etag,
+        "added_ts": 1.0, "completed_ts": 0.0,
     }]}
     (tmp_path / "state.json").write_text(json.dumps(state))
     work = tmp_path / "incomplete" / nzo_id
     work.mkdir(parents=True)
     (work / FILE_NAME).write_bytes(partial)
+    if sidecar is not None:
+        (work / downloads_module.RESUME_FILE).write_text(sidecar)
     return nzo_id
 
 
@@ -178,11 +182,13 @@ def test_restart_resumes_interrupted_download(tmp_path, monkeypatch, support_ran
         httpd.shutdown()
 
 
-def test_restart_does_not_trust_an_unverifiable_partial_file(tmp_path, monkeypatch):
-    """A partial file without the validators of its first response (e.g. left
-    by an older version) can't be tied to the remote file: download it again
-    instead of appending to it."""
-    nzo_id = _seed_interrupted_job(tmp_path, b"x" * 120_000, etag="")
+@pytest.mark.parametrize("sidecar", [None, "", "{not json", "[]", '{"etag": 5}', json.dumps({"etag": ""})],
+                         ids=["missing", "empty", "corrupt", "list", "wrong-type", "no-validator"])
+def test_restart_does_not_trust_an_unverifiable_partial_file(tmp_path, monkeypatch, sidecar):
+    """A partial file without readable validators of its first response (e.g.
+    left by an older version) can't be tied to the remote file: download it
+    again instead of appending to it - and never crash on the sidecar."""
+    nzo_id = _seed_interrupted_job(tmp_path, b"x" * 120_000, sidecar=sidecar)
     httpd, handler = _serve(PAYLOAD, support_range=True)
     try:
         url = f"http://127.0.0.1:{httpd.server_address[1]}/{FILE_NAME}"
@@ -371,11 +377,13 @@ def _finished(job) -> bytes:
     return final.read_bytes()
 
 
-def test_resume_appends_a_verified_range(faulty):
+def test_resume_appends_a_verified_range(faulty, tmp_path):
     job, requests = faulty(_entity(SMALL, cut=CUT), _entity(SMALL))
-    assert job.status == "completed" and _finished(job) == SMALL
+    assert job.status == "completed" and _finished(job) == SMALL  # sidecar not moved along
     # continued from the saved prefix, conditional on the same file
     assert requests == [(None, None), (f"bytes={CUT}-", ETAG)]
+    assert not any((tmp_path / "complete").rglob(downloads_module.RESUME_FILE))
+    assert not (tmp_path / "incomplete" / job.nzo_id).exists()
 
 
 @pytest.mark.parametrize("content_range, body", [
@@ -506,11 +514,41 @@ def test_cancel_while_waiting_to_resume(faulty, client, monkeypatch, tmp_path, a
     assert queue("pause") is True
     assert wait_for(lambda: job.nzo_id not in manager._tasks)
     assert job.status == "paused" and partial.stat().st_size == CUT and len(requests) == 1
+    sidecar = partial.parent / downloads_module.RESUME_FILE
+    assert json.loads(sidecar.read_text())["etag"] == ETAG
 
     assert queue("resume") is True
     assert wait_for(lambda: job.status == "completed")
     assert _finished(job) == SMALL
     assert requests[1] == (f"bytes={CUT}-", ETAG)
+    assert not partial.parent.exists()  # sidecar removed with the work dir
+
+
+# Job fields as of upstream/main. The persisted job records must not gain keys:
+# an older version's load_state() does Job(**record) and skips any record with
+# an unknown field, so after a rollback every job written by this one vanished.
+UPSTREAM_JOB_FIELDS = {
+    "nzo_id", "ident", "name", "category", "size", "title", "status", "downloaded",
+    "speed", "error", "storage", "added_ts", "completed_ts", "sab_hidden",
+}
+
+
+def test_state_file_stays_loadable_by_older_versions(faulty, client, monkeypatch, tmp_path):
+    """Resume validators live in a sidecar in the work dir, not in state.json."""
+    monkeypatch.setattr(downloads_module, "RESUME_DELAYS", (30,))
+    job, requests = faulty(_entity(SMALL, cut=CUT), _entity(SMALL), until=("downloading",))
+    sidecar = tmp_path / "incomplete" / job.nzo_id / downloads_module.RESUME_FILE
+    assert wait_for(sidecar.exists)
+    client.get("/sabnzbd/api", params={"mode": "queue", "name": "pause", "value": job.nzo_id,
+                                       "apikey": "testkey"})
+    assert wait_for(lambda: job.status == "paused")
+
+    assert {f.name for f in dataclasses.fields(downloads_module.Job)} == UPSTREAM_JOB_FIELDS
+    old_job = dataclasses.make_dataclass("OldJob", sorted(UPSTREAM_JOB_FIELDS))
+    records = json.loads((tmp_path / "state.json").read_text())["jobs"]
+    assert records and all(set(r) <= UPSTREAM_JOB_FIELDS for r in records)
+    for record in records:
+        old_job(**record)  # what an older load_state() does; must not raise
 
 
 def test_retry_failed_job(client, fake_webshare, tmp_path):

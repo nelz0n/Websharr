@@ -28,6 +28,7 @@ HISTORY_CAP = 500  # keep this many completed/failed records in the UI history
 # times (waiting RESUME_DELAYS seconds) before the job fails.
 RESUME_ATTEMPTS = 5
 RESUME_DELAYS = (5, 15, 30, 60, 120)
+RESUME_FILE = ".resume.json"  # validators of a partial file, next to it
 
 
 def describe_error(exc: BaseException) -> str:
@@ -60,16 +61,54 @@ def _content_length(resp: httpx.Response) -> int | None:
         return None
 
 
-def _if_range(job: "Job") -> str:
-    """Validator sent as If-Range on a resume; "" when nothing ties the partial
-    file to the remote one (then it can't be resumed safely). A weak ETag may
-    match a file with different bytes, so it doesn't count."""
-    if job.etag and not job.etag.startswith("W/"):
-        return job.etag
-    return job.last_modified
+@dataclass
+class _Validators:
+    """ETag / Last-Modified of the response a partial download was started
+    with. A resume only appends when the server shows it is still that file.
+
+    Kept in a sidecar file next to the partial data, not in the job state: an
+    older version skips state records with unknown fields, so a rollback would
+    lose every job. The file goes away with the partial file (restart, delete,
+    completion); a missing or unreadable one means "start over"."""
+
+    path: Path
+    etag: str = ""
+    last_modified: str = ""
+
+    @classmethod
+    def load(cls, path: Path) -> "_Validators":
+        try:
+            data = json.loads(path.read_text())
+            etag, last_modified = data.get("etag", ""), data.get("last_modified", "")
+        except (OSError, ValueError, AttributeError):
+            return cls(path)
+        if not isinstance(etag, str) or not isinstance(last_modified, str):
+            return cls(path)
+        return cls(path, etag, last_modified)
+
+    def save(self, resp: httpx.Response) -> None:
+        self.etag = resp.headers.get("etag", "")
+        self.last_modified = resp.headers.get("last-modified", "")
+        try:
+            self.path.write_text(json.dumps({"etag": self.etag, "last_modified": self.last_modified}))
+        except OSError as exc:  # only costs the resume after a restart
+            logger.warning("Could not write %s: %s", self.path, exc)
+
+    def clear(self) -> None:
+        self.etag = self.last_modified = ""
+        self.path.unlink(missing_ok=True)
+
+    @property
+    def if_range(self) -> str:
+        """Validator sent as If-Range on a resume; "" when nothing ties the
+        partial file to the remote one (then it can't be resumed safely). A
+        weak ETag may match a file with different bytes, so it doesn't count."""
+        if self.etag and not self.etag.startswith("W/"):
+            return self.etag
+        return self.last_modified
 
 
-def _resume_problem(job: "Job", resp: httpx.Response, offset: int, expected: int) -> str:
+def _resume_problem(seen: _Validators, resp: httpx.Response, offset: int, expected: int) -> str:
     """Why a 206 answer to `Range: bytes=<offset>-` must not be appended to the
     partial file ("" if it may). The range has to start exactly at the end of
     the partial file and run to the end of a file of the expected size, and the
@@ -87,9 +126,9 @@ def _resume_problem(job: "Job", resp: httpx.Response, offset: int, expected: int
     length = _content_length(resp)
     if length is not None and length != end - start + 1:
         return f"Content-Length {length} doesn't match the range"
-    if job.etag and resp.headers.get("etag", "") != job.etag:
+    if seen.etag and resp.headers.get("etag", "") != seen.etag:
         return "ETag changed"
-    if job.last_modified and resp.headers.get("last-modified", "") != job.last_modified:
+    if seen.last_modified and resp.headers.get("last-modified", "") != seen.last_modified:
         return "Last-Modified changed"
     return ""
 
@@ -116,11 +155,6 @@ class Job:
     # we honor that for the SABnzbd view but keep the record in the Websharr UI
     # history. This flag hides it from Sonarr only.
     sab_hidden: bool = False
-    # Validators of the remote file the partial download belongs to (ETag and
-    # Last-Modified of the response it was started with). A resume only appends
-    # when the server shows it is still that file; otherwise it starts over.
-    etag: str = ""
-    last_modified: str = ""
 
     @property
     def job_name(self) -> str:
@@ -399,6 +433,9 @@ class DownloadManager:
         work_dir = self._incomplete_path(job)
         work_dir.mkdir(parents=True, exist_ok=True)
         target = work_dir / job.name
+        # Sidecar next to the partial file; job names never start with a dot
+        # (sanitize_filename), and only `target` is moved to the complete dir.
+        seen = _Validators.load(work_dir / RESUME_FILE)
 
         # Size announced by the NZB (exact Webshare bytes). A response never
         # overrides it; only when the NZB had none does the first one set it.
@@ -408,27 +445,27 @@ class DownloadManager:
         async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(30.0, read=120.0)) as http:
             interruptions = 0
             while True:
-                if offset and (not _if_range(job) or (expected and offset >= expected)):
+                if offset and (not seen.if_range or (expected and offset >= expected)):
                     # Nothing proves the partial file is part of the remote one
                     # (no validator from its first response), or it can't be a
                     # prefix of it: appending could splice two different files.
                     logger.info("Partial file of %s can't be resumed safely; starting over", job.nzo_id)
-                    offset = self._restart(job, target)
-                headers = {"Range": f"bytes={offset}-", "If-Range": _if_range(job)} if offset else {}
+                    offset = self._restart(job, target, seen)
+                headers = {"Range": f"bytes={offset}-", "If-Range": seen.if_range} if offset else {}
                 try:
                     async with http.stream("GET", url, headers=headers) as resp:
                         if offset and resp.status_code == 416:
                             # Partial file no longer matches the remote; start over.
-                            offset = self._restart(job, target)
+                            offset = self._restart(job, target, seen)
                             continue
                         if offset and resp.status_code == 206:
-                            problem = _resume_problem(job, resp, offset, expected)
+                            problem = _resume_problem(seen, resp, offset, expected)
                             if problem:
                                 # Never append what may be another file or another
                                 # part of it; download the whole file again.
                                 logger.warning("Download %s can't resume at %d bytes (%s); starting over",
                                                job.nzo_id, offset, problem)
-                                offset = self._restart(job, target)
+                                offset = self._restart(job, target, seen)
                                 continue
                             if not expected:
                                 expected = job.size = _content_range(resp)[2]
@@ -447,9 +484,7 @@ class DownloadManager:
                                     f"server sends {length} bytes, expected {expected}")
                             if not expected and length:
                                 expected = job.size = length
-                            job.etag = resp.headers.get("etag", "")
-                            job.last_modified = resp.headers.get("last-modified", "")
-                            self._save_state()  # a resume after a restart verifies them too
+                            seen.save(resp)  # a later resume (pause, restart) checks them
                         else:
                             logger.info("Resuming %s from %d bytes", job.nzo_id, offset)
                         await self._stream_to_file(job, resp, target, offset, expected)
@@ -485,10 +520,10 @@ class DownloadManager:
         job.size = job.size or received
 
     @staticmethod
-    def _restart(job: Job, target: Path) -> int:
+    def _restart(job: Job, target: Path, seen: _Validators) -> int:
         """Drop the partial file and its validators; the download starts at 0."""
         target.unlink(missing_ok=True)
-        job.etag = job.last_modified = ""
+        seen.clear()
         job.downloaded = 0
         return 0
 
