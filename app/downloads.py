@@ -64,7 +64,8 @@ def _content_length(resp: httpx.Response) -> int | None:
 @dataclass
 class _Validators:
     """ETag / Last-Modified of the response a partial download was started
-    with. A resume only appends when the server shows it is still that file.
+    with. A resume sends one as If-Range, so the server only answers 206 while
+    it is still that file.
 
     Kept in a sidecar file next to the partial data, not in the job state: an
     older version skips state records with unknown fields, so a rollback would
@@ -111,8 +112,12 @@ class _Validators:
 def _resume_problem(seen: _Validators, resp: httpx.Response, offset: int, expected: int) -> str:
     """Why a 206 answer to `Range: bytes=<offset>-` must not be appended to the
     partial file ("" if it may). The range has to start exactly at the end of
-    the partial file and run to the end of a file of the expected size, and the
-    validators the partial file was downloaded with must not have changed."""
+    the partial file and run to the end of a file of the expected size.
+
+    The request carried If-Range, so a 206 already means the server found the
+    validator unchanged (RFC 9110 13.1.5); a changed file gets a 200. Webshare's
+    nginx doesn't repeat Last-Modified on a 206, so a missing validator is fine,
+    but one the 206 does carry must still be the one the partial file has."""
     rng = _content_range(resp)
     if rng is None:
         return f"invalid Content-Range {resp.headers.get('content-range', '')!r}"
@@ -126,9 +131,10 @@ def _resume_problem(seen: _Validators, resp: httpx.Response, offset: int, expect
     length = _content_length(resp)
     if length is not None and length != end - start + 1:
         return f"Content-Length {length} doesn't match the range"
-    if seen.etag and resp.headers.get("etag", "") != seen.etag:
+    etag, last_modified = resp.headers.get("etag"), resp.headers.get("last-modified")
+    if seen.etag and etag is not None and etag != seen.etag:
         return "ETag changed"
-    if seen.last_modified and resp.headers.get("last-modified", "") != seen.last_modified:
+    if seen.last_modified and last_modified is not None and last_modified != seen.last_modified:
         return "Last-Modified changed"
     return ""
 

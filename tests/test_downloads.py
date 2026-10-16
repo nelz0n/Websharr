@@ -25,6 +25,7 @@ FILE_NAME = "Resumed.Movie.2024.mkv"
 # the server still reports the ones it was downloaded with.
 ETAG = '"websharr-v1"'
 LAST_MODIFIED = "Wed, 30 Sep 2026 10:00:00 GMT"
+CHANGED = "Thu, 01 Oct 2026 10:00:00 GMT"  # Last-Modified after the file changed
 
 
 def _serve(payload: bytes, support_range: bool):
@@ -286,31 +287,35 @@ OTHER = bytes(range(100, 164))  # same size, different content
 CUT = 16  # bytes saved before the first connection drops
 
 
-def _entity(payload: bytes, etag: str | None = ETAG, cut: int | None = None,
-            honor_if_range: bool = True, content_length: bool = True):
-    """Step for _serve_script: answer like a static file server. 206 from the
-    requested offset (200 if If-Range names another version), 416 past the
-    end; `cut` drops the connection after that many body bytes."""
+def _entity(payload: bytes, last_modified: str | None = LAST_MODIFIED, etag: str | None = None,
+            cut: int | None = None, honor_if_range: bool = True, content_length: bool = True,
+            validators_on_206: bool = False):
+    """Step for _serve_script: answer like Webshare's nginx by default - a 200
+    with Last-Modified but no ETag, a 206 from the requested offset carrying no
+    validator, a 200 instead when If-Range names another version, 416 past the
+    end. `cut` drops the connection after that many body bytes."""
 
     def step(start, if_range):
-        headers = {"ETag": etag, "Last-Modified": LAST_MODIFIED} if etag else {}
-        if not content_length:
-            headers["Content-Length"] = None
-        if start is None or (honor_if_range and if_range and if_range != etag):
-            return 200, headers, payload, cut
+        headers = {} if content_length else {"Content-Length": None}
+        validators = {"ETag": etag, "Last-Modified": last_modified}
+        if start is None or (honor_if_range and if_range and if_range not in (etag, last_modified)):
+            return 200, {**headers, **validators}, payload, cut
         if start >= len(payload):
             return 416, {"Content-Range": f"bytes */{len(payload)}"}, b"", None
+        if validators_on_206:
+            headers.update(validators)
         headers["Content-Range"] = f"bytes {start}-{len(payload) - 1}/{len(payload)}"
         return 206, headers, payload[start:], cut
 
     return step
 
 
-def _partial(content_range: str | None, body: bytes, etag: str = ETAG):
+def _partial(content_range: str | None, body: bytes, last_modified: str | None = None,
+             etag: str | None = None):
     """Step for _serve_script: a 206 with the given Content-Range and body."""
 
     def step(start, if_range):
-        headers = {"ETag": etag, "Last-Modified": LAST_MODIFIED}
+        headers = {"ETag": etag, "Last-Modified": last_modified}
         if content_range is not None:
             headers["Content-Range"] = content_range
         return 206, headers, body, None
@@ -377,11 +382,20 @@ def _finished(job) -> bytes:
     return final.read_bytes()
 
 
-def test_resume_appends_a_verified_range(faulty, tmp_path):
-    job, requests = faulty(_entity(SMALL, cut=CUT), _entity(SMALL))
+@pytest.mark.parametrize("first, resume, if_range", [
+    # Webshare: Last-Modified on the 200, no validator at all on the 206 - the
+    # 206 to an If-Range request is itself the proof that the file is the same
+    ({}, {}, LAST_MODIFIED),
+    ({}, {"validators_on_206": True}, LAST_MODIFIED),
+    ({"etag": ETAG}, {"etag": ETAG}, ETAG),  # a strong ETag is preferred
+    ({"etag": ETAG}, {"etag": ETAG, "validators_on_206": True}, ETAG),
+], ids=["206-without-validator", "206-repeats-last-modified", "etag-206-without-validator",
+        "etag-206-repeats-it"])
+def test_resume_appends_a_verified_range(faulty, tmp_path, first, resume, if_range):
+    job, requests = faulty(_entity(SMALL, cut=CUT, **first), _entity(SMALL, **resume))
     assert job.status == "completed" and _finished(job) == SMALL  # sidecar not moved along
     # continued from the saved prefix, conditional on the same file
-    assert requests == [(None, None), (f"bytes={CUT}-", ETAG)]
+    assert requests == [(None, None), (f"bytes={CUT}-", if_range)]
     assert not any((tmp_path / "complete").rglob(downloads_module.RESUME_FILE))
     assert not (tmp_path / "incomplete" / job.nzo_id).exists()
 
@@ -402,44 +416,38 @@ def test_mismatched_206_restarts_instead_of_appending(faulty, content_range, bod
     discarded and the file downloaded again from byte 0."""
     job, requests = faulty(_entity(SMALL, cut=CUT), _partial(content_range, body), _entity(SMALL))
     assert job.status == "completed" and _finished(job) == SMALL
-    assert requests[1] == (f"bytes={CUT}-", ETAG)
+    assert requests[1] == (f"bytes={CUT}-", LAST_MODIFIED)
     assert requests[2] == (None, None)  # started over, nothing appended
 
 
-@pytest.mark.parametrize("resume", [
-    (_entity(OTHER, etag='"websharr-v2"'),),  # honors If-Range: whole new file
-    (_entity(OTHER, etag='"websharr-v2"', honor_if_range=False),),  # 206 of the new file
-    (_partial(f"bytes {CUT}-63/64", OTHER[CUT:], etag='"websharr-v2"'), _entity(OTHER, etag='"websharr-v2"')),
-    (_entity(OTHER, etag=None, honor_if_range=False),),  # suffix without validators
-], ids=["if-range-200", "changed-etag-206", "changed-etag-partial", "validators-gone"])
-def test_changed_remote_file_is_not_spliced(faulty, resume):
+@pytest.mark.parametrize("steps, if_range", [
+    # If-Range honoured: the changed file comes back whole as a 200
+    ((_entity(SMALL, cut=CUT), _entity(OTHER, last_modified=CHANGED)), LAST_MODIFIED),
+    # If-Range ignored, but the 206 carries a validator that differs
+    ((_entity(SMALL, cut=CUT),
+      _entity(OTHER, last_modified=CHANGED, honor_if_range=False, validators_on_206=True)), LAST_MODIFIED),
+    ((_entity(SMALL, cut=CUT, etag=ETAG),
+      _entity(OTHER, etag='"websharr-v2"', honor_if_range=False, validators_on_206=True)), ETAG),
+    ((_entity(SMALL, cut=CUT), _partial(f"bytes {CUT}-63/64", OTHER[CUT:], last_modified=CHANGED),
+      _entity(OTHER, last_modified=CHANGED)), LAST_MODIFIED),
+], ids=["if-range-200", "changed-last-modified-206", "changed-etag-206", "changed-partial"])
+def test_changed_remote_file_is_not_spliced(faulty, steps, if_range):
     """Reproduced in review: the refreshed link served a correctly positioned
     suffix of a different file (other ETag); saved prefix + new suffix made a
     64-byte Completed file matching neither. The result must be one file."""
-    job, requests = faulty(_entity(SMALL, cut=CUT), *resume)
+    job, requests = faulty(*steps)
     assert job.status == "completed"
     assert _finished(job) == OTHER  # the new file whole, not SMALL[:16] + OTHER[16:]
-    assert requests[1] == (f"bytes={CUT}-", ETAG)
+    assert requests[1] == (f"bytes={CUT}-", if_range)
 
 
 def test_resume_without_validators_starts_over(faulty):
-    """Without ETag/Last-Modified nothing proves the partial file is part of
-    what the server sends now, so it is never appended to."""
-    job, requests = faulty(_entity(SMALL, etag=None, cut=CUT), _entity(SMALL, etag=None))
+    """Without ETag/Last-Modified there is nothing to send as If-Range, so
+    nothing proves the partial file is part of what the server sends now: it
+    is never appended to."""
+    job, requests = faulty(_entity(SMALL, last_modified=None, cut=CUT), _entity(SMALL, last_modified=None))
     assert job.status == "completed" and _finished(job) == SMALL
     assert requests == [(None, None), (None, None)]
-
-
-def test_resume_with_last_modified_only(faulty):
-    def no_etag(step):
-        def wrapped(start, if_range):
-            status, headers, body, cut = step(start, if_range)
-            return status, {k: v for k, v in headers.items() if k != "ETag"}, body, cut
-        return wrapped
-
-    job, requests = faulty(no_etag(_entity(SMALL, cut=CUT)), no_etag(_entity(SMALL, honor_if_range=False)))
-    assert job.status == "completed" and _finished(job) == SMALL
-    assert requests[1] == (f"bytes={CUT}-", LAST_MODIFIED)
 
 
 def test_resume_ignored_range_restarts_from_zero(faulty):
@@ -447,14 +455,14 @@ def test_resume_ignored_range_restarts_from_zero(faulty):
     ignore_range = _entity(SMALL)
     job, requests = faulty(_entity(SMALL, cut=CUT), lambda start, if_range: ignore_range(None, None))
     assert job.status == "completed" and _finished(job) == SMALL
-    assert requests[1] == (f"bytes={CUT}-", ETAG)
+    assert requests[1] == (f"bytes={CUT}-", LAST_MODIFIED)
 
 
 def test_resume_416_restarts_from_zero(faulty):
     gone = lambda start, if_range: (416, {"Content-Range": "bytes */64"}, b"", None)  # noqa: E731
     job, requests = faulty(_entity(SMALL, cut=CUT), gone, _entity(SMALL))
     assert job.status == "completed" and _finished(job) == SMALL
-    assert requests[1:] == [(f"bytes={CUT}-", ETAG), (None, None)]
+    assert requests[1:] == [(f"bytes={CUT}-", LAST_MODIFIED), (None, None)]
 
 
 def test_short_close_delimited_body_resumes(faulty):
@@ -462,7 +470,7 @@ def test_short_close_delimited_body_resumes(faulty):
     the connection closed cleanly: the NZB said 64 bytes."""
     job, requests = faulty(_entity(SMALL, cut=48, content_length=False), _entity(SMALL))
     assert job.status == "completed" and _finished(job) == SMALL
-    assert requests[1] == ("bytes=48-", ETAG)
+    assert requests[1] == ("bytes=48-", LAST_MODIFIED)
 
 
 @pytest.mark.parametrize("steps", [
@@ -487,7 +495,7 @@ def test_resume_gives_up_after_the_attempts(faulty, monkeypatch):
     job, requests = faulty(lambda start, if_range: _entity(SMALL, cut=CUT)(start, if_range))
     assert job.status == "failed"
     # first try + 2 verified resumes, each continuing from what was on disk
-    assert requests == [(None, None), (f"bytes={CUT}-", ETAG), (f"bytes={2 * CUT}-", ETAG)]
+    assert requests == [(None, None), (f"bytes={CUT}-", LAST_MODIFIED), (f"bytes={2 * CUT}-", LAST_MODIFIED)]
     assert not any(Path(job.storage or "/nonexistent").glob("*"))
 
 
@@ -515,12 +523,12 @@ def test_cancel_while_waiting_to_resume(faulty, client, monkeypatch, tmp_path, a
     assert wait_for(lambda: job.nzo_id not in manager._tasks)
     assert job.status == "paused" and partial.stat().st_size == CUT and len(requests) == 1
     sidecar = partial.parent / downloads_module.RESUME_FILE
-    assert json.loads(sidecar.read_text())["etag"] == ETAG
+    assert json.loads(sidecar.read_text())["last_modified"] == LAST_MODIFIED
 
     assert queue("resume") is True
     assert wait_for(lambda: job.status == "completed")
     assert _finished(job) == SMALL
-    assert requests[1] == (f"bytes={CUT}-", ETAG)
+    assert requests[1] == (f"bytes={CUT}-", LAST_MODIFIED)
     assert not partial.parent.exists()  # sidecar removed with the work dir
 
 
