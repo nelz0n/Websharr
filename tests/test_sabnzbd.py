@@ -39,8 +39,9 @@ def test_addfile_download_lifecycle(client, fake_webshare, tmp_path, httpserver=
         fake_webshare.file_link_url = f"http://127.0.0.1:{httpd.server_address[1]}/file.mkv"
 
         nzb = build_nzb("id9", "zaklinac.raw.file.mkv", len(payload))
-        # Sonarr uploads the NZB named after the release title; that becomes the
-        # job folder and the file name (so both carry SxxEyy), keeping the extension.
+        # The NZB is uploaded named after the release title; that becomes the job
+        # folder (so it carries SxxEyy). An upload name is not a trusted release
+        # title (no websharr_title embedded by our feed), so the file keeps its raw name.
         resp = client.post(
             "/sabnzbd/api",
             params={"mode": "addfile", "apikey": "testkey", "cat": "tv"},
@@ -62,7 +63,7 @@ def test_addfile_download_lifecycle(client, fake_webshare, tmp_path, httpserver=
         assert slot["storage"].endswith("tv/Zaklinac S01E05 1080p")
 
         from pathlib import Path
-        final = Path(slot["storage"]) / "Zaklinac S01E05 1080p.mkv"
+        final = Path(slot["storage"]) / "zaklinac.raw.file.mkv"
         assert final.read_bytes() == payload
     finally:
         httpd.shutdown()
