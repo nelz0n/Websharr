@@ -41,15 +41,19 @@ def test_release_title_normalizes_for_tvsearch():
 def test_release_title_drops_the_episode_count_after_the_marker():
     """An explicit total ("z 26", "of 26", "/26") is the season's episode count,
     never an episode: it leaves the name instead of turning into "-E26". A real
-    range keeps its end, and a bare hyphen is a range, as Sonarr reads it."""
+    range keeps its end. A bare hyphen after SxxEyy is ambiguous and left as
+    before."""
     for total in ("S01E03 z 26", "S01E03 ze 26", "S01E03 of 26", "S01E03/26", "S01E03 / 26"):
         title = release_title("Show", "1", "3", f"Show {total} 1080p CZ.mkv")
         assert title == "Show S01E03 - Show 1080p CZ", total
     for rng, ep, want in (("S01E01-E03", "1", "S01E01-E03"), ("S01E01E02", "1", "S01E01-E02"),
-                          ("S01E01-E02", "1", "S01E01-E02"), ("1x01-03", "1", "S01E01-E03"),
-                          ("S01E23-26", "23", "S01E23-E26")):
+                          ("S01E01-E02", "1", "S01E01-E02"), ("1x01-03", "1", "S01E01-E03")):
         title = release_title("Show", "1", ep, f"Show.{rng}.1080p.mkv")
         assert title == f"Show {want} - Show.1080p", rng
+    # "S01E23-26" may be part 23 of 26 (Czech uploads) or a range: unchanged
+    name = "Byl jednou jeden zivot S01E23-26 1987 CZ dab - Hormony (puvodni dabing CST).mp4"
+    assert release_title("Once Upon a Time... Life", "1", "23", name) == \
+        "Once Upon a Time... Life S01E23 - Byl jednou jeden zivot -26 1987 CZ dab - Hormony (puvodni dabing CST)"
     # the range is only carried over when it starts at the released episode
     assert release_title("Show", "2", "1", "Show S01E01-E03 1080p.mkv") == "Show S02E01 - Show 1080p"
     # a "range" ending before its start, or a "total" below the episode, is
@@ -425,8 +429,10 @@ def test_regular_episode_search_drops_explicit_special(client, fake_webshare, mo
     ("Show S01E01-E03 1080p CZ.mkv", "1", "Show S01E01-E03 - Show 1080p CZ"),
     ("Show 1x01-03 1080p CZ.mkv", "1", "Show S01E01-E03 - Show 1080p CZ"),
     ("Show.S01E01E02.1080p.CZ.mkv", "1", "Show S01E01-E02 - Show.1080p.CZ"),
-    # a bare hyphen is a range, as Sonarr's parser reads it — emitted cleanly
-    ("Show S01E23-26 1080p CZ.mkv", "23", "Show S01E23-E26 - Show 1080p CZ"),
+    # a bare hyphen after SxxEyy is ambiguous (part 23 of 26, or a range):
+    # released exactly as before, neither a range nor dropped
+    ("Show S01E23-26 1080p CZ.mkv", "23", "Show S01E23 - Show -26 1080p CZ"),
+    ("Show S01E25-26 1080p CZ.mkv", "25", "Show S01E25 - Show -26 1080p CZ"),
     ("Show S01E07 1080p CZ.mkv", "7", "Show S01E07 - Show 1080p CZ"),
 ])
 def test_episode_search_release_title_for_totals_and_ranges(client, fake_webshare, monkeypatch,

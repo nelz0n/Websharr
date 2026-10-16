@@ -202,15 +202,15 @@ def _asciify(text: str) -> str:
 
 # An episode marker in a file name with what may follow it: a total ("S01E23 z 26",
 # "S01E23 of 26", "S01E23/26" — the season's episode count, never an episode),
-# an explicit E endpoint ("S01E01-E03", "S01E01E02") or a bare hyphen range
-# ("S01E01-03", "1x01-03"). A bare hyphen is a range, as in Sonarr's parser,
-# even where a Czech upload meant "part 23 of 26" by "S01E23-26": the two are
-# indistinguishable, and Sonarr reads the range anyway.
+# an explicit E endpoint ("S01E01-E03", "S01E01E02") or a "1x01-03" range.
+# A bare hyphen after SxxEyy ("S01E23-26") is ambiguous — a range, or a Czech
+# upload's "part 23 of 26" — so it is not consumed: only the marker goes, as
+# before, rather than releasing one file as four episodes or dropping a range.
 _MARKER_RE = re.compile(
     r"\b(?P<marker>s(?P<s1>\d{1,2})e(?P<e1>\d{1,3})|(?P<s2>\d{1,2})x(?P<e2>\d{1,3}))"
     r"(?:(?:\s*/\s*|\s+(?:of|ze?)\s+)(?P<total>\d{1,3})"
     r"|(?:[-–]?e(?P<end>\d{1,3}))+"
-    r"|[-–](?P<bare>\d{2,3}))?\b", re.I)
+    r"|(?(s2)[-–](?P<bare>\d{2,3})))?\b", re.I)
 
 
 def _marker_episodes(m: re.Match) -> tuple[int, int, int]:
