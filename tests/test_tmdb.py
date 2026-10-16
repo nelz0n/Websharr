@@ -210,3 +210,69 @@ def test_runtime_says_whether_it_is_the_episodes_own(monkeypatch):
     assert asyncio.run(tmdb.runtime("tok", "tv", tmdbid="82728", season="1", ep="2")) == (7, False)
     assert asyncio.run(tmdb.runtime("tok", "tv", tmdbid="82728", season="1")) == (7, False)
     assert asyncio.run(tmdb.runtime("tok", "tv")) == (0, False)
+
+
+class _RivalsClient:
+    """Stands in for httpx.AsyncClient for movie_rivals: Rocky (1366), its
+    collection and a title search; `fail` makes the search answer 500."""
+
+    calls: list[tuple[str, dict | None]] = []
+    fail = False
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url, params=None):
+        _RivalsClient.calls.append((url, params))
+        if url.endswith("/movie/1366"):
+            return _Resp({"id": 1366, "title": "Rocky", "belongs_to_collection": {"id": 1575}})
+        if url.endswith("/find/tt0075148"):
+            return _Resp({"movie_results": [{"id": 1366, "title": "Rocky"}]})
+        if url.endswith("/collection/1575"):
+            return _Resp({"parts": [
+                {"id": 1366, "title": "Rocky", "original_title": "Rocky", "release_date": "1976-11-21"},
+                {"id": 1367, "title": "Rocky II", "original_title": "Rocky II", "release_date": "1979-06-15"},
+                {"id": 1374, "title": "Rocky Balboa", "original_title": "Rocky Balboa",
+                 "release_date": "2006-12-20"}]})
+        if url.endswith("/search/movie"):
+            if _RivalsClient.fail:
+                r = _Resp({})
+                r.status_code = 500
+                return r
+            return _Resp({"results": [
+                {"id": 1366, "title": "Rocky", "original_title": "Rocky", "release_date": "1976-11-21"},
+                {"id": 99999, "title": "Rocky", "original_title": "Rocky", "release_date": "1981-10-02"}]})
+        return _Resp({})
+
+
+def test_movie_rivals_lists_other_films_and_fails_closed(monkeypatch):
+    """The collection's other parts and the other films a title search finds,
+    never the movie itself; cached once it succeeded, None when TMDB fails."""
+    monkeypatch.setattr(tmdb.httpx, "AsyncClient", _RivalsClient)
+    monkeypatch.setattr(tmdb, "_resolved", {})
+    monkeypatch.setattr(tmdb, "_parts_cache", {})
+    monkeypatch.setattr(tmdb, "_hits_cache", {})
+    _RivalsClient.calls, _RivalsClient.fail = [], False
+    rivals = asyncio.run(tmdb.movie_rivals("tok", ["Rocky"], tmdbid="1366"))
+    assert ("Rocky II", 1979, True) in rivals and ("Rocky Balboa", 2006, True) in rivals
+    assert ("Rocky", 1981, False) in rivals
+    assert not any(year == 1976 for _t, year, _p in rivals)
+    first = len(_RivalsClient.calls)
+    assert first == 1 + 2 + 2                     # details, collection en/cs, search en/cs
+    assert asyncio.run(tmdb.movie_rivals("tok", ["Rocky"], tmdbid="1366")) == rivals
+    assert len(_RivalsClient.calls) == first      # cached
+    # by IMDb id: one /find, then the cached collection
+    assert asyncio.run(tmdb.movie_rivals("tok", ["Rocky"], imdbid="tt0075148")) == rivals
+    # a failed lookup is not cached and says "can't tell"
+    monkeypatch.setattr(tmdb, "_hits_cache", {})
+    _RivalsClient.fail = True
+    assert asyncio.run(tmdb.movie_rivals("tok", ["Rocky"], tmdbid="1366")) is None
+    assert tmdb._hits_cache == {}
+    assert asyncio.run(tmdb.movie_rivals("", ["Rocky"], tmdbid="1366")) is None
+    assert asyncio.run(tmdb.movie_rivals("tok", ["Rocky"])) is None

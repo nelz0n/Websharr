@@ -355,3 +355,76 @@ async def runtime(token: str, kind: str, tmdbid=None, imdbid=None, tvdbid=None,
         return 0, False
     _put(_runtime_cache, (kind, tid, *episode), (minutes, exact))
     return minutes, exact
+
+
+# Films a movie file could be mistaken for, for the opt-in title prefix (see
+# torznab.movie_prefix_refusal). Only successful lookups are cached.
+_parts_cache: dict[int, list[tuple[int, str, int]]] = {}
+_hits_cache: dict[str, list[tuple[int, str, int]]] = {}
+
+
+def _films(items: list) -> list[tuple[int, str, int]]:
+    """(id, title, year) for every title of each movie in a TMDB list."""
+    out = []
+    for it in items or []:
+        for key in ("title", "original_title"):
+            name = str(it.get(key) or "").strip()
+            if name:
+                out.append((it.get("id"), name, _year(it)))
+    return out
+
+
+async def movie_rivals(token: str, titles, tmdbid=None, imdbid=None
+                       ) -> list[tuple[str, int, bool]] | None:
+    """(title, year, same_collection) of the other TMDB movies a file named
+    after one of `titles` could be, or None when TMDB can't tell (fail closed:
+    the caller then claims no identity).
+
+    Two sources, each in English and Czech: the first page of a title search for
+    each of `titles` (another film of the same name — "Rocky" 1976 and 1981) and
+    the other parts of the movie's collection ("Rocky II", "Rocky Balboa"). At
+    most 4 + 2 × len(titles) calls, each cached once it succeeds.
+    """
+    if not token:
+        return None
+    imdb = _imdb_id(imdbid)
+    tid = (int(tmdbid) if str(tmdbid).isdigit() else None) if tmdbid else \
+        _resolved.get(("movie", tmdbid, None, imdb))
+    if not (tid or imdb):
+        return None
+    rivals: list[tuple[str, int, bool]] = []
+    try:
+        async with httpx.AsyncClient(timeout=10.0, headers=_headers(token)) as client:
+
+            async def get(url: str, **params) -> dict:
+                r = await client.get(url, params=params or None)
+                if r.status_code != 200:
+                    raise ValueError(f"HTTP {r.status_code} for {url}")
+                return r.json()
+
+            if not tid:
+                hits = (await get(f"{_BASE}/find/{imdb}", external_source="imdb_id")).get("movie_results") or []
+                tid = hits[0].get("id") if hits else None
+                if not tid:
+                    return None
+            tid = int(tid)
+            if tid not in _parts_cache:
+                cid = ((await get(f"{_BASE}/movie/{tid}")).get("belongs_to_collection") or {}).get("id")
+                parts: list[tuple[int, str, int]] = []
+                if cid:
+                    for params in ({}, {"language": "cs-CZ"}):
+                        parts += _films((await get(f"{_BASE}/collection/{cid}", **params)).get("parts"))
+                _put(_parts_cache, tid, parts)
+            rivals += [(name, year, True) for pid, name, year in _parts_cache[tid] if pid != tid]
+            for title in dict.fromkeys(t for t in titles if t):
+                key = title.casefold()
+                if key not in _hits_cache:
+                    found: list[tuple[int, str, int]] = []
+                    for params in ({}, {"language": "cs-CZ"}):
+                        found += _films((await get(f"{_BASE}/search/movie", query=title, **params)).get("results"))
+                    _put(_hits_cache, key, found)
+                rivals += [(name, year, False) for hid, name, year in _hits_cache[key] if hid != tid]
+    except (httpx.HTTPError, KeyError, ValueError, TypeError, AttributeError) as exc:
+        logger.warning("TMDB rivals of movie %s failed: %s", tmdbid or imdb, str(exc) or type(exc).__name__)
+        return None
+    return rivals
